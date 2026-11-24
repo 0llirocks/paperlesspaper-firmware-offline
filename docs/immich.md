@@ -32,9 +32,11 @@ Header für alle Aufrufe: `x-api-key: <key>`. Die `X-OpenPaper-*`-Telemetrie wir
 
 | Name | Länge | EEPROM (`500 +`) | BLE-UUID (`…-0000-0000-0000-000000000001`) | Eigenschaft |
 | :--- | :--- | :--- | :--- | :--- |
-| `immichUrl` | ≤ 128 | 820 (130 B) | `1000000e` | read, write |
-| `immichApiKey` | ≤ 128 | 950 (130 B) | `1000000f` | **write** (wie HTTP-Passwort) |
-| `immichAlbumIds` | ≤ 10 UUIDs, Komma-getrennt, ≤ 369 | 1080 (372 B, bis 1951) | `10000010` | read, write |
+| `immichUrl` | ≤ 128 | 820 (130 B) | `10000010` | read, write |
+| `immichApiKey` | ≤ 128 | 950 (130 B) | `10000011` | **write** (wie HTTP-Passwort) |
+| `immichAlbumIds` | ≤ 10 UUIDs, Komma-getrennt, ≤ 369 | 1080 (370 B, bis 1950) | `10000012` | read, write |
+
+(`1000000e`/`1000000f` belegt auf `dev` die Galerie.)
 
 `imageMode` (`10000002`) akzeptiert zusätzlich `2`. Remote-JSON: `immichUrl`, `immichApiKey`,
 `immichAlbumIds` (Array oder Komma-String), `imageMode` (`1` oder `2`).
@@ -50,7 +52,7 @@ Auflösung.
 
 ## Web-UI
 
-- Tab „Gerät“: Auswahl der Bildquelle *Download-URL* / *Immich*.
+- Ansicht „Bild“ → „Abruf per URL“: Schalter *Eigene URL* / *Immich*.
 - Felder: Immich-URL, API-Key (Passwortfeld, „leer = gespeicherten behalten“), Alben (Liste).
 - Album-Link aus Immich einfügen (`https://immich.example/albums/<uuid>`) → URL und ID werden
   übernommen. Kein Abruf der Albumliste aus dem Browser: CORS/Mixed Content, und der Key darf
@@ -66,8 +68,20 @@ Auflösung.
 
 ## Stand
 
-- [ ] Firmware
-- [ ] Web-UI
-- [ ] Simulator, Konsistenz-Test, HIL-Settings, Doku
-- [ ] Build (`pio run -e epd7`, `-e epd13`) – Werkzeuge noch nicht installiert
-- [ ] Tests
+Branch `feature/immich` (Basis `upstream/dev` e8ba2ee), Commit 89013f0, 2026-11-24:
+
+- [x] Firmware (`src/immich.*`, `src/main.cpp`, `src/types.h`)
+- [x] Web-UI (`DeviceBleInterface.js`, `app.js`, `index.html`, `styles.css`)
+- [x] Simulator, Konsistenz-Test, Web-Test `test_save_immich_settings`, HIL-Settings, README
+- [x] Unit-Tests geschrieben (`test/test_immich`, `[env:native]`)
+- [ ] **Nichts davon kompiliert oder ausgeführt** – Werkzeuge fehlen noch:
+  `pio run -e epd7`, `pio run -e epd13`, `pio test -e native`,
+  `cd web; npm ci; npm run build`, `python -m pytest webtest`
+- [ ] Test gegen das echte Immich des Nutzers
+- [ ] Hardware (eigenes Display / HIL upstream)
+
+Offene Punkte:
+- `[env:native]` erbt aus `[env]`; ob die leeren Overrides (`framework =`, `board =`) in
+  PlatformIO greifen, beim ersten `pio test -e native` prüfen.
+- Bildzählung bei mehreren Alben kostet pro Aufwachen einen Request je Album; ggf. später
+  in RTC-Speicher cachen.
