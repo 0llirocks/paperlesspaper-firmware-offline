@@ -80,6 +80,19 @@ Branch `feature/immich` (Basis `upstream/dev` e8ba2ee), Commit 89013f0, 2026-11-
 - [ ] Test gegen das echte Immich des Nutzers
 - [ ] Hardware (eigenes Display / HIL upstream)
 
+Nachtrag Commit 2fee94b (Orientierung):
+- Immich kann nicht nach Format suchen (`SearchFilter` hat kein width/height). Das Gerät holt 10
+  Zufallsfotos und nimmt das erste, dessen Seitenverhältnis höchstens 1,5-fach vom Display
+  abweicht (7,3" quer, 13,3" hoch), sonst das nächstliegende. `width`/`height` sind bei Immich
+  schon EXIF-gedreht (`metadata.service.ts`, `isSidewards`).
+- Immich ≥ 3.2: eine Suche mit `filter.albumIds.any` (ODER) statt Zählen pro Album; alte Felder
+  dürfen nicht mit `filter` gemischt werden. Bei HTTP 400 Rückfall auf die alte Suche
+  (`immichSearchShape` im RTC-Speicher).
+- Die Firmware dreht Bilder nie um 90° (Auto-Rotation nur 180°). „Passend“ heißt deshalb
+  passend zum Display-Raster, nicht zur Seite, auf der der Rahmen steht. Hochkant-Betrieb
+  des 7,3" bräuchte eine 90°-Drehung in der Bildaufbereitung/Anzeige: eigenes Feature,
+  nur mit Hardware testbar.
+
 Offene Punkte:
 - `[env:native]` erbt aus `[env]`; ob die leeren Overrides (`framework =`, `board =`) in
   PlatformIO greifen, beim ersten `pio test -e native` prüfen.
