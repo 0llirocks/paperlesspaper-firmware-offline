@@ -93,6 +93,20 @@ Nachtrag Commit 2fee94b (Orientierung):
   des 7,3" bräuchte eine 90°-Drehung in der Bildaufbereitung/Anzeige: eigenes Feature,
   nur mit Hardware testbar.
 
+Nachtrag (Lagesensor, Wunsch des Nutzers: automatisch über den Sensor):
+- Das Gerät dreht Immich-Fotos jetzt selbst um 90°, wenn der Rahmen gedreht hängt
+  (`frameTurnDegrees()`, `turnRaster()`, `src/raster.*`, Test `test/test_raster`).
+- **Default, am Gerät zu prüfen** (`src/main.cpp`):
+  `FRAME_TURNED_SIDE_A 1`, `FRAME_TURNED_SIDE_B 3`, `FRAME_TURN_DEGREES 270`.
+- Checkliste, sobald ein Gerät da ist (serieller Monitor, 115200 Baud):
+  1. Rahmen quer hinstellen, Reset drücken → Log `[ACC] Values: … Orient: N` notieren.
+  2. Hochkant (beide Richtungen) und kopfüber wiederholen.
+  3. Im Immich-Modus prüfen: `[IMMICH] Frame side N: turned/as built` und ob das Foto
+     aufrecht steht. Steht es kopfüber → `FRAME_TURN_DEGREES` auf 90; wird quer/hochkant
+     verwechselt → die Seiten 0/2 statt 1/3 eintragen.
+- Bild wird nur beim Aufwachen gewählt; Drehen während des Wachseins zeichnet nicht neu
+  (`isOrientUpdate` wird nirgends ausgewertet – schon vorher so).
+
 Offene Punkte:
 - `[env:native]` erbt aus `[env]`; ob die leeren Overrides (`framework =`, `board =`) in
   PlatformIO greifen, beim ersten `pio test -e native` prüfen.
