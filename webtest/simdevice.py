@@ -42,6 +42,9 @@ CHR_AUTO_ROTATION = "1000000c-0000-0000-0000-000000000001"
 CHR_FW_VERSION = "1000000d-0000-0000-0000-000000000001"
 CHR_GALLERY_STATE = "1000000e-0000-0000-0000-000000000001"
 CHR_READ_DATA = "1000000f-0000-0000-0000-000000000001"
+CHR_IMMICH_URL = "10000010-0000-0000-0000-000000000001"
+CHR_IMMICH_API_KEY = "10000011-0000-0000-0000-000000000001"
+CHR_IMMICH_ALBUMS = "10000012-0000-0000-0000-000000000001"
 
 SERVICES = {
     SVC_DEVICE: (CHR_WIFI_CONNECTED, CHR_WIFI_INFO, CHR_WIFI_SCAN, CHR_SYSTEM_INFO),
@@ -50,9 +53,10 @@ SERVICES = {
         CHR_URL, CHR_IMAGE_MODE, CHR_UPLOAD_DATA, CHR_UPLOAD_CMD, CHR_TIMEOUT, CHR_HTTP_USER,
         CHR_HTTP_PASSWORD, CHR_MOTION_WAKEUP, CHR_CHARGER_MODE, CHR_SETTINGS_URL,
         CHR_AUTO_ROTATION, CHR_FW_VERSION, CHR_GALLERY_STATE, CHR_READ_DATA,
+        CHR_IMMICH_URL, CHR_IMMICH_API_KEY, CHR_IMMICH_ALBUMS,
     ),
 }
-WRITE_ONLY = (CHR_WIFI_PASSWORD, CHR_HTTP_PASSWORD, CHR_UPLOAD_DATA)
+WRITE_ONLY = (CHR_WIFI_PASSWORD, CHR_HTTP_PASSWORD, CHR_IMMICH_API_KEY, CHR_UPLOAD_DATA)
 
 # Limits of the firmware (src/main.cpp)
 MAX_SETTING_STRING_LEN = 128
@@ -60,6 +64,10 @@ MAX_WIFI_SSID_LEN = 32
 MAX_WIFI_PASS_LEN = 64
 MIN_SLEEP_TIMEOUT = 60
 MAX_SLEEP_TIMEOUT = 2592000
+MAX_IMMICH_ALBUMS = 10
+MAX_IMMICH_ALBUMS_LEN = 369
+IMAGE_MODES = ("0", "1", "2")  # gallery, download URL, Immich
+ALBUM_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 BLE_BUFFER_SIZE = 32768
 MIN_OTA_FW_SIZE = 65536
 MAX_OTA_FW_SIZE = 0x1D0000
@@ -99,6 +107,8 @@ TEXT_SETTINGS = {
     CHR_SETTINGS_URL: ("settings_url", MAX_SETTING_STRING_LEN),
     CHR_HTTP_USER: ("http_user", MAX_SETTING_STRING_LEN),
     CHR_HTTP_PASSWORD: ("http_password", MAX_SETTING_STRING_LEN),
+    CHR_IMMICH_URL: ("immich_url", MAX_SETTING_STRING_LEN),
+    CHR_IMMICH_API_KEY: ("immich_api_key", MAX_SETTING_STRING_LEN),
 }
 SWITCH_SETTINGS = {
     CHR_MOTION_WAKEUP: "motion_wakeup",
@@ -174,10 +184,24 @@ class GattError(Exception):
         self.name = name
 
 
+def parse_album_list(text):
+    """Immich::parseAlbumList() of the firmware, for what the web UI sends (IDs separated by ',').
+    None if an entry is not an album ID or there are too many: the firmware then ignores the list."""
+    ids = []
+    for entry in filter(None, re.split(r"[\s,;]+", text)):
+        entry = entry.lower()
+        if not ALBUM_ID.fullmatch(entry):
+            return None
+        if entry not in ids:
+            ids.append(entry)
+    return ids if len(ids) <= MAX_IMMICH_ALBUMS else None
+
+
 def factory_settings():
     return {
         "url": "", "settings_url": "", "http_user": "", "http_password": "", "timeout": 3600,
         "image_mode": 1, "motion_wakeup": False, "charger_mode": False, "auto_rotation": True,
+        "immich_url": "", "immich_api_key": "", "immich_albums": [],
     }
 
 
@@ -375,6 +399,8 @@ class SimulatedDevice:
             CHR_CHARGER_MODE: "1" if s["charger_mode"] else "0",
             CHR_AUTO_ROTATION: "1" if s["auto_rotation"] else "0",
             CHR_FW_VERSION: self.version,
+            CHR_IMMICH_URL: s["immich_url"],
+            CHR_IMMICH_ALBUMS: ",".join(s["immich_albums"]),
             CHR_WIFI_SSID: self.wifi_ssid,
             CHR_WIFI_SCAN: self.scan_result(),
             CHR_SYSTEM_INFO: json.dumps(self.system_info()),
@@ -420,6 +446,8 @@ class SimulatedDevice:
         if self.legacy and uuid == CHR_FW_VERSION:
             return False
         if not self.gallery_supported and uuid in (CHR_GALLERY_STATE, CHR_READ_DATA):
+            return False
+        if self.legacy and uuid in (CHR_IMMICH_URL, CHR_IMMICH_API_KEY, CHR_IMMICH_ALBUMS):
             return False
         return any(uuid in chars for chars in SERVICES.values())
 
@@ -551,8 +579,12 @@ class SimulatedDevice:
             if text.strip().lstrip("-").isdigit() and MIN_SLEEP_TIMEOUT <= int(text) <= MAX_SLEEP_TIMEOUT:
                 self.settings["timeout"] = int(text)
         elif uuid == CHR_IMAGE_MODE:
-            if text in ("0", "1"):
+            if text in IMAGE_MODES:
                 self.settings["image_mode"] = int(text)
+        elif uuid == CHR_IMMICH_ALBUMS:
+            albums = parse_album_list(text) if len(data) <= MAX_IMMICH_ALBUMS_LEN else None
+            if albums is not None:
+                self.settings["immich_albums"] = albums
         elif uuid == CHR_WIFI_SSID:
             if len(data) <= MAX_WIFI_SSID_LEN:
                 self.wifi_ssid = text

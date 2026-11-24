@@ -21,6 +21,7 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <esp_ota_ops.h>
+#include <esp_random.h>
 #include <rom/crc.h>
 #include <rom/rtc.h>
 #include <soc/lp_aon_reg.h>
@@ -28,6 +29,7 @@
 #include "chunked_decoder.h"
 #include "epaper_display.h"
 #include "gallery.h"
+#include "immich.h"
 #include "storage.h"
 #include "types.h"
 #include "usb_link.h"
@@ -103,6 +105,15 @@
 #define MAX_WIFI_PASS_LEN 64       // EEPROM 40-105
 #define MIN_SLEEP_TIMEOUT 60       // seconds
 #define MAX_SLEEP_TIMEOUT 2592000  // seconds (30 days)
+#define MAX_IMMICH_ALBUMS 10       // album IDs in the Immich album list
+#define MAX_IMMICH_ALBUMS_LEN 369  // characters of the album list: 10 IDs of 36 characters and 9 commas
+static_assert(MAX_IMMICH_ALBUMS == Immich::MAX_ALBUMS && MAX_IMMICH_ALBUMS_LEN == Immich::MAX_ALBUM_LIST_LEN,
+              "Immich limits differ");
+
+// settings.imageMode: where the picture comes from
+#define IMAGE_MODE_GALLERY 0 // pictures sent over Bluetooth
+#define IMAGE_MODE_URL 1     // download from settings.downloadUrl
+#define IMAGE_MODE_IMMICH 2  // random picture from the Immich albums
 
 #define DEFAULT_SLEEP 3600 // Default time how long to sleep after update
 #define FAILSAVE_TIMER 180 // Time to shutdown the device if no reaction or hangup
@@ -166,6 +177,9 @@ Settings settings = {
     .settingsUrl = "",
     .settingsLastModified = "",
     .autoRotation = true,
+    .immichUrl = "",
+    .immichApiKey = "",
+    .immichAlbumIds = "",
     .forceDownload = false,
     .skipSetupMode = false};
 
@@ -198,6 +212,7 @@ StoreFile jpgInFile;
 SdFs sd;
 RTC_DATA_ATTR timeval previousWakeup = timeval{.tv_sec = 0, .tv_usec = 0};
 RTC_DATA_ATTR uint8_t failedUpdates = 0;
+RTC_DATA_ATTR char immichLastAsset[Immich::ID_LEN + 1] = ""; // not shown twice in a row
 // What the setup mode had done when the frame restarted itself for the update (see setup()).
 // Not initialised at a restart: valid only with RESUME_MAGIC in its upper half.
 RTC_NOINIT_ATTR uint32_t resumeState;
@@ -273,6 +288,7 @@ bool usbCheckConnect();
 int calculateSleepDuration(int defaultTimeout, bool forceReset, bool getDataOnly = false);
 bool resetAll(bool resetWifi);
 wakeup_reason_t getWakeupReason();
+int loadImageFromImmich(const String &fileName);
 void runSetupMode();
 int processHttpDownload(String fileName);
 bool sdInit(void);
@@ -1212,10 +1228,12 @@ void writeStringToFlash(const char *toStore, int startAddr, int maxLen, bool com
       EEPROM.commit();
 }
 
-String readStringFromFlash(int startAddr) {
-   char in[129];
+String readStringFromFlash(int startAddr, int maxLen = MAX_SETTING_STRING_LEN) {
+   char in[MAX_IMMICH_ALBUMS_LEN + 1]; // the longest string setting
+   if (maxLen > MAX_IMMICH_ALBUMS_LEN)
+      maxLen = MAX_IMMICH_ALBUMS_LEN;
    int i = 0;
-   for (; i < 128; i++) {
+   for (; i < maxLen; i++) {
       char c = EEPROM.read(startAddr + i);
       if (c == '\0' || c == (char)0xFF) {
          break;
@@ -1265,6 +1283,9 @@ void saveSettingsToFlash(int startAddr) {
    writeStringToFlash(settings.settingsUrl.c_str(), startAddr + 555, maxLen, false);
    writeStringToFlash(settings.settingsLastModified.c_str(), startAddr + 685, maxLen, false);
    writeIntToFlash(settings.autoRotation, startAddr + 815, false);
+   writeStringToFlash(settings.immichUrl.c_str(), startAddr + 820, maxLen, false);
+   writeStringToFlash(settings.immichApiKey.c_str(), startAddr + 950, maxLen, false);
+   writeStringToFlash(settings.immichAlbumIds.c_str(), startAddr + 1080, MAX_IMMICH_ALBUMS_LEN, false); // up to 1450
    EEPROM.commit();
    Serial.println("[MEM] Settings saved to EEPROM");
 }
@@ -1287,6 +1308,11 @@ void restoreSettingsToFlash(int startAddr) {
    settings.settingsLastModified = readStringFromFlash(startAddr + 685);
    int autoRot = readIntFromFlash(startAddr + 815);
    settings.autoRotation = (autoRot == 0) ? false : true;
+   settings.immichUrl = readStringFromFlash(startAddr + 820);
+   settings.immichApiKey = readStringFromFlash(startAddr + 950);
+   settings.immichAlbumIds = readStringFromFlash(startAddr + 1080, MAX_IMMICH_ALBUMS_LEN);
+   if (settings.imageMode < IMAGE_MODE_GALLERY || settings.imageMode > IMAGE_MODE_IMMICH)
+      settings.imageMode = IMAGE_MODE_URL; // damaged memory: the mode of a new frame
    Serial.println("[MEM] Settings restored from EEPROM");
    if (DEBUG_FLAG) {
       Serial.printf("[MEM] Settings - BatteryWarning: %d WifiWarning: %d SleepDisabled: %d ImageMode: %d MotionWakeup: %d ChargerMode: %d\n", settings.showBatteryWarning, settings.showWifiWarning, settings.sleepDisabled, settings.imageMode, settings.motionWakeup, settings.chargerMode);
@@ -1782,7 +1808,7 @@ void gattWrite(NimBLECharacteristic *pCharacteristic) {
    }
    else if (uuidStr == "10000002-0000-0000-0000-000000000001") {
       int newMode = atoi(attrVal.c_str());
-      if (newMode != 0 && newMode != 1) {
+      if (newMode != IMAGE_MODE_GALLERY && newMode != IMAGE_MODE_URL && newMode != IMAGE_MODE_IMMICH) {
          Serial.printf("[BLE] ERROR: Invalid Image Mode %d, ignored.\n", newMode);
          return;
       }
@@ -1820,6 +1846,30 @@ void gattWrite(NimBLECharacteristic *pCharacteristic) {
       settings.settingsUrl = attrVal.c_str();
       Serial.printf("[BLE] Set Settings URL: %s\n", settings.settingsUrl.c_str());
       settings.settingsLastModified = ""; // Reset cache on new URL
+   }
+   else if (uuidStr == "10000010-0000-0000-0000-000000000001") {
+      if (!bleValueFits(attrVal, MAX_SETTING_STRING_LEN, "Immich URL"))
+         return;
+      settings.immichUrl = attrVal.c_str();
+      Serial.printf("[BLE] Set Immich URL: %s\n", settings.immichUrl.c_str());
+   }
+   else if (uuidStr == "10000011-0000-0000-0000-000000000001") {
+      if (!bleValueFits(attrVal, MAX_SETTING_STRING_LEN, "Immich API key"))
+         return;
+      settings.immichApiKey = attrVal.c_str();
+      pCharacteristic->setValue(""); // write-only, like the passwords
+      Serial.println("[BLE] Set Immich API key");
+   }
+   else if (uuidStr == "10000012-0000-0000-0000-000000000001") {
+      std::vector<std::string> ids;
+      if (!bleValueFits(attrVal, MAX_IMMICH_ALBUMS_LEN, "Immich albums") || !Immich::parseAlbumList(attrVal.c_str(), ids)) {
+         Serial.println("[BLE] ERROR: Immich albums not valid, ignored.");
+         pCharacteristic->setValue(settings.immichAlbumIds.c_str());
+         return;
+      }
+      settings.immichAlbumIds = Immich::joinAlbumList(ids).c_str();
+      pCharacteristic->setValue(settings.immichAlbumIds.c_str());
+      Serial.printf("[BLE] Set Immich albums: %s\n", settings.immichAlbumIds.c_str());
    }
    else if (uuidStr == "10000009-0000-0000-0000-000000000001") {
       String strVal = attrVal.c_str();
@@ -2237,6 +2287,9 @@ bool BleInit(String deviceId, bool enable) {
    NimBLECharacteristic *fwVersionCharacteristic = epaperSettingsService->createCharacteristic("1000000d-0000-0000-0000-000000000001", NIMBLE_PROPERTY::READ);
    galleryStateCharacteristic = epaperSettingsService->createCharacteristic("1000000e-0000-0000-0000-000000000001", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
    NimBLECharacteristic *readDataCharacteristic = epaperSettingsService->createCharacteristic("1000000f-0000-0000-0000-000000000001", NIMBLE_PROPERTY::READ);
+   NimBLECharacteristic *immichUrlCharacteristic = epaperSettingsService->createCharacteristic("10000010-0000-0000-0000-000000000001", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+   NimBLECharacteristic *immichApiKeyCharacteristic = epaperSettingsService->createCharacteristic("10000011-0000-0000-0000-000000000001", NIMBLE_PROPERTY::WRITE); // write-only, see WiFi password
+   NimBLECharacteristic *immichAlbumsCharacteristic = epaperSettingsService->createCharacteristic("10000012-0000-0000-0000-000000000001", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
 
    wifiSsidCharacteristic->setCallbacks(&chrCallbacks);
    wifiPwCharacteristic->setCallbacks(&chrCallbacks);
@@ -2253,6 +2306,9 @@ bool BleInit(String deviceId, bool enable) {
    chargerModeCharacteristic->setCallbacks(&chrCallbacks);
    autoRotationCharacteristic->setCallbacks(&chrCallbacks);
    readDataCharacteristic->setCallbacks(&chrCallbacks);
+   immichUrlCharacteristic->setCallbacks(&chrCallbacks);
+   immichApiKeyCharacteristic->setCallbacks(&chrCallbacks);
+   immichAlbumsCharacteristic->setCallbacks(&chrCallbacks);
 
    // Services are started when the server is started
 
@@ -2282,6 +2338,8 @@ bool BleInit(String deviceId, bool enable) {
    chargerModeCharacteristic->setValue(settings.chargerMode ? "1" : "0");
    autoRotationCharacteristic->setValue(settings.autoRotation ? "1" : "0");
    fwVersionCharacteristic->setValue(SOFTWARE_VERSION);
+   immichUrlCharacteristic->setValue(settings.immichUrl.c_str());
+   immichAlbumsCharacteristic->setValue(settings.immichAlbumIds.c_str());
    galleryStateCharacteristic->setValue(Gallery::stateJson().c_str());
 
    UsbLink::addService(deviceDataService);
@@ -2301,7 +2359,9 @@ bool BleInit(String deviceId, bool enable) {
    return true;
 }
 // https://forum.arduino.cc/index.php?topic=565603.0
-int downloadAndSaveFile(String fileName, String url) {
+// immichKey: the picture comes from Immich. It is sent the API key instead of the HTTP login and
+// no device status headers. Every picture counts as new (no If-None-Match / If-Modified-Since).
+int downloadAndSaveFile(String fileName, String url, const char *immichKey = nullptr) {
    int success = 0;
    tempLastModified = "";
    lastDownloadedBytes = 0;
@@ -2323,12 +2383,15 @@ int downloadAndSaveFile(String fileName, String url) {
       http.begin(url);
    }
 
-   if (settings.httpAuthUser.length() > 0) {
+   if (immichKey != nullptr) {
+      http.addHeader("x-api-key", immichKey);
+   }
+   else if (settings.httpAuthUser.length() > 0) {
       http.setAuthorization(settings.httpAuthUser.c_str(), settings.httpAuthPassword.c_str());
       Serial.println("[DL] HTTP Auth enabled");
    }
 
-   bool canSkipIfUnchanged = !settings.forceDownload && hasValidFlashImage("tmp.bmp");
+   bool canSkipIfUnchanged = immichKey == nullptr && !settings.forceDownload && hasValidFlashImage("tmp.bmp");
    if (canSkipIfUnchanged && settings.lastModified.length() > 0) {
       if (settings.lastModified.startsWith("etag:"))
          http.addHeader("If-None-Match", settings.lastModified.substring(5));
@@ -2336,9 +2399,10 @@ int downloadAndSaveFile(String fileName, String url) {
          http.addHeader("If-Modified-Since", settings.lastModified);
    }
 
-   const char *headerKeys[] = {"Last-Modified", "ETag", "X-OpenPaper-Sleep-Seconds", "Transfer-Encoding"};
-   http.collectHeaders(headerKeys, 4);
-   addTelemetryHeaders(http);
+   const char *headerKeys[] = {"Last-Modified", "ETag", "X-OpenPaper-Sleep-Seconds", "Transfer-Encoding", "Content-Type"};
+   http.collectHeaders(headerKeys, 5);
+   if (immichKey == nullptr)
+      addTelemetryHeaders(http);
 
    int httpCode = http.GET();
    int srvSleep = http.header("X-OpenPaper-Sleep-Seconds").toInt();
@@ -2357,6 +2421,13 @@ int downloadAndSaveFile(String fileName, String url) {
    if (httpCode > 0) {
       // file found at server
       if (httpCode == HTTP_CODE_OK) {
+         String contentType = http.header("Content-Type");
+         contentType.toLowerCase();
+         if (immichKey != nullptr && contentType.indexOf("webp") >= 0) {
+            Serial.println("[IMMICH] The server sends previews as WebP. Set the preview format to JPEG (not progressive) in the Immich image settings.");
+            http.end();
+            return DL_HTTP_STATUS;
+         }
          String etag = http.header("ETag");
          etag.trim();
          String lastMod = http.header("Last-Modified");
@@ -3109,6 +3180,10 @@ bool resetAll(bool resetWifi) {
    settings.timeout = DEFAULT_SLEEP;
    settings.httpAuthUser = "";
    settings.httpAuthPassword = "";
+   settings.immichUrl = "";
+   settings.immichApiKey = "";
+   settings.immichAlbumIds = "";
+   immichLastAsset[0] = '\0';
    settings.chargerMode = false; // after a reset the charger is off until the user switches it on again
    chargeMode(false);
    if (resetWifi) {
@@ -3460,7 +3535,10 @@ bool ensureWifi() {
 int processHttpDownload(String fileName) {
    int dlSuccess = 0;
    if (ensureWifi()) {
-      dlSuccess = loadImageFromWeb(settings.downloadUrl, "tmp_raw.bin");
+      if (settings.imageMode == IMAGE_MODE_IMMICH)
+         dlSuccess = loadImageFromImmich("tmp_raw.bin");
+      else
+         dlSuccess = loadImageFromWeb(settings.downloadUrl, "tmp_raw.bin");
       if (dlSuccess == 0) {
          if (processImageFile("tmp_raw.bin", fileName.c_str())) {
             dlSuccess = 0;
@@ -3498,6 +3576,9 @@ void initFirstBoot(void) {
       settings.httpAuthUser = "";
       settings.httpAuthPassword = "";
       settings.lastModified = "";
+      settings.immichUrl = "";
+      settings.immichApiKey = "";
+      settings.immichAlbumIds = "";
 
       storeSleepTimeMem(3600);
       saveSettingsToFlash(EEPROM_SETTINGS_ADR);
@@ -3529,6 +3610,136 @@ class LimitedBody : public Stream
  private:
    size_t limit;
 };
+
+// --- Immich (README, "Immich") ---
+
+static void immichLogStatus(const char *what, int code) {
+   if (code < 0)
+      Serial.printf("[IMMICH] %s: no answer from the server (%s)\n", what, HTTPClient::errorToString(code).c_str());
+   else if (code == 401)
+      Serial.printf("[IMMICH] %s: HTTP 401, the API key is not valid\n", what);
+   else if (code == 403)
+      Serial.printf("[IMMICH] %s: HTTP 403, the API key lacks a permission (asset.read, asset.view, asset.statistics)\n", what);
+   else if (code == 400)
+      Serial.printf("[IMMICH] %s: HTTP 400, an album ID is not valid\n", what);
+   else
+      Serial.printf("[IMMICH] %s: HTTP %d\n", what, code);
+}
+
+// POST of a JSON body to the Immich API. Returns the HTTP status (or a negative HTTPClient error);
+// `answer` holds the body of a 200 answer.
+static int immichPost(const String &base, const char *path, const std::string &body, String &answer) {
+   answer = "";
+   const String url = base + path;
+   WiFiClientSecure secureClient;
+   secureClient.setInsecure();
+   HTTPClient http;
+   http.setTimeout(10000);
+   if (url.startsWith("https:"))
+      http.begin(secureClient, url);
+   else
+      http.begin(url);
+   http.addHeader("Content-Type", "application/json");
+   http.addHeader("Accept", "application/json");
+   http.addHeader("x-api-key", settings.immichApiKey);
+   int code = http.POST((uint8_t *)body.data(), body.size());
+   if (code == HTTP_CODE_OK) {
+      LimitedBody limited(Immich::MAX_JSON_SIZE);
+      const int received = http.writeToStream(&limited);
+      if (limited.overflow) {
+         Serial.printf("[IMMICH] Answer larger than %u bytes, ignored\n", (unsigned)Immich::MAX_JSON_SIZE);
+         code = HTTPC_ERROR_TOO_LESS_RAM;
+      }
+      else if (received < 0) {
+         code = received;
+      }
+      else {
+         answer = limited.text;
+      }
+   }
+   http.end();
+   return code;
+}
+
+// Random picture of the Immich albums, saved as `fileName`. Every picture of all albums is equally
+// likely: the album is drawn by its number of pictures. Results as loadImageFromWeb().
+int loadImageFromImmich(const String &fileName) {
+   std::vector<std::string> albums;
+   Immich::parseAlbumList(settings.immichAlbumIds.c_str(), albums);
+   if (settings.immichUrl.length() == 0 || settings.immichApiKey.length() == 0 || albums.empty()) {
+      Serial.println("[IMMICH] Not set up: the URL, the API key and at least one album are needed");
+      return DL_HTTP_STATUS;
+   }
+   const String base = Immich::baseUrl(settings.immichUrl.c_str()).c_str();
+   String answer;
+   int code = 0;
+
+   size_t album = 0;
+   if (albums.size() > 1) {
+      // Several albumIds in one search would only find pictures that are in all of them.
+      std::vector<uint32_t> counts;
+      for (const std::string &id : albums) {
+         uint32_t total = 0;
+         code = immichPost(base, "/api/search/statistics", Immich::statisticsBody(id), answer);
+         if (code < 0) {
+            immichLogStatus("Counting the pictures", code);
+            return DL_REQUEST_FAILED;
+         }
+         if (code != HTTP_CODE_OK || !Immich::parseStatisticsTotal(answer.c_str(), answer.length(), total)) {
+            immichLogStatus("Counting the pictures", code);
+            counts.clear();
+            break;
+         }
+         counts.push_back(total);
+      }
+      if (counts.size() == albums.size()) {
+         const uint64_t pick = ((uint64_t)esp_random() << 32) | esp_random();
+         const int picked = Immich::pickWeighted(counts, pick);
+         if (picked < 0) {
+            Serial.println("[IMMICH] The albums contain no pictures");
+            return DL_HTTP_STATUS;
+         }
+         album = (size_t)picked;
+         Serial.printf("[IMMICH] %llu pictures in %u albums\n", (unsigned long long)Immich::sum(counts), (unsigned)albums.size());
+      }
+      else {
+         Serial.println("[IMMICH] Every album counts the same (pictures not counted)");
+         album = esp_random() % albums.size();
+      }
+   }
+
+   code = immichPost(base, "/api/search/random", Immich::randomSearchBody(albums[album], Immich::RANDOM_COUNT), answer);
+   if (code != HTTP_CODE_OK) {
+      immichLogStatus("Random search", code);
+      return (code < 0) ? DL_REQUEST_FAILED : DL_HTTP_STATUS;
+   }
+   std::vector<std::string> assets;
+   if (!Immich::parseAssetIds(answer.c_str(), answer.length(), assets)) {
+      Serial.println("[IMMICH] Answer of the random search not readable");
+      return DL_HTTP_STATUS;
+   }
+   const std::string asset = Immich::chooseAsset(assets, immichLastAsset);
+   if (asset.empty()) {
+      Serial.printf("[IMMICH] Album %s contains no pictures\n", albums[album].c_str());
+      return DL_HTTP_STATUS;
+   }
+   Serial.printf("[IMMICH] Album %u of %u (%s), picture %s\n", (unsigned)album + 1, (unsigned)albums.size(), albums[album].c_str(), asset.c_str());
+
+   const String url = base + Immich::previewPath(asset).c_str();
+   int downloadOk = DL_REQUEST_FAILED;
+   for (int attempt = 1; attempt <= 3; attempt++) {
+      downloadOk = downloadAndSaveFile(fileName, url, settings.immichApiKey.c_str());
+      if (downloadOk != DL_REQUEST_FAILED && downloadOk != DL_INCOMPLETE)
+         break;
+      delay(1000);
+   }
+   tempLastModified = ""; // every picture is new, nothing to remember
+   if (downloadOk == DL_OK)
+      strlcpy(immichLastAsset, asset.c_str(), sizeof(immichLastAsset));
+   else
+      Serial.printf("[IMMICH] Download of the preview failed (%d)\n", downloadOk);
+   return downloadOk;
+}
 
 void fetchRemoteSettings() {
    if (settings.settingsUrl.length() == 0)
@@ -3649,6 +3860,55 @@ void fetchRemoteSettings() {
             if (v.length() <= MAX_SETTING_STRING_LEN) {
                settings.httpAuthPassword = v;
                changed = true;
+            }
+         }
+         if (doc["immichUrl"].is<String>()) {
+            String v = doc["immichUrl"].as<String>();
+            if (v.length() <= MAX_SETTING_STRING_LEN) {
+               settings.immichUrl = v;
+               changed = true;
+            }
+            else {
+               Serial.println("[HTTP] ERROR: immichUrl too long, ignored.");
+            }
+         }
+         if (doc["immichApiKey"].is<String>()) {
+            String v = doc["immichApiKey"].as<String>();
+            if (v.length() <= MAX_SETTING_STRING_LEN) {
+               settings.immichApiKey = v;
+               changed = true;
+            }
+         }
+         if (doc["immichAlbumIds"].is<JsonArray>() || doc["immichAlbumIds"].is<String>()) {
+            // an array of IDs (or album links), or one string separated by commas
+            std::string list;
+            if (doc["immichAlbumIds"].is<JsonArray>()) {
+               for (JsonVariant v : doc["immichAlbumIds"].as<JsonArray>()) {
+                  list += v.is<const char *>() ? v.as<const char *>() : "?"; // "?" makes the list invalid
+                  list += ',';
+               }
+            }
+            else {
+               list = doc["immichAlbumIds"].as<const char *>();
+            }
+            std::vector<std::string> ids;
+            if (Immich::parseAlbumList(list, ids)) {
+               settings.immichAlbumIds = Immich::joinAlbumList(ids).c_str();
+               changed = true;
+            }
+            else {
+               Serial.printf("[HTTP] ERROR: immichAlbumIds not valid (at most %d album IDs), ignored.\n", MAX_IMMICH_ALBUMS);
+            }
+         }
+         if (doc["imageMode"].is<int>()) {
+            // 0 (gallery) needs the pictures sent over Bluetooth: only the network sources here
+            const int mode = doc["imageMode"].as<int>();
+            if (mode == IMAGE_MODE_URL || mode == IMAGE_MODE_IMMICH) {
+               settings.imageMode = mode;
+               changed = true;
+            }
+            else {
+               Serial.printf("[HTTP] ERROR: imageMode %d not allowed here (1 or 2), ignored.\n", mode);
             }
          }
 
@@ -3882,7 +4142,8 @@ void setup() {
       // Bluetooth keeps its memory until the next start. A download (TLS) needs more than may be
       // left: the update then runs after a restart, which skips the setup mode.
       const bool usesNetwork = wifiSettings.ssid.length() > 0 &&
-                               (settings.settingsUrl.length() > 0 || (settings.imageMode == 1 && settings.downloadUrl.length() > 0));
+                               (settings.settingsUrl.length() > 0 || (settings.imageMode == IMAGE_MODE_URL && settings.downloadUrl.length() > 0) ||
+                                settings.imageMode == IMAGE_MODE_IMMICH);
       if (usesNetwork && ESP.getFreeHeap() < UPDATE_MIN_FREE_HEAP) {
          Serial.printf("[MAIN] %u bytes of heap free after the setup mode: restarting for the update.", (unsigned)ESP.getFreeHeap());
          Serial.println();
@@ -3961,21 +4222,28 @@ void loop() {
          settings.imageMode = 1;
          saveSettingsToFlash(EEPROM_SETTINGS_ADR);
       }
+      else if (settings.imageMode == 0 && Gallery::count() == 0 && settings.immichUrl.length() > 0 && settings.immichAlbumIds.length() > 0) {
+         Serial.println("[IMAGE] Gallery mode active but the gallery is empty. Fallback to Immich.");
+         settings.imageMode = IMAGE_MODE_IMMICH;
+         saveSettingsToFlash(EEPROM_SETTINGS_ADR);
+      }
 
       if (settings.settingsUrl.length() > 0 && ensureWifi()) {
          fetchRemoteSettings(); // This might change imageMode or downloadUrl!
       }
 
-      const bool canDownload = wifiSettings.ssid.length() > 0 && settings.downloadUrl.length() > 0;
+      const bool immichSetUp = settings.immichUrl.length() > 0 && settings.immichApiKey.length() > 0 && settings.immichAlbumIds.length() > 0;
+      const bool canDownload = wifiSettings.ssid.length() > 0 &&
+                               ((settings.imageMode == IMAGE_MODE_IMMICH) ? immichSetUp : settings.downloadUrl.length() > 0);
       const bool hasPicture = (settings.imageMode == 0) ? Gallery::count() > 0 : hasValidFlashImage(fileName.c_str());
-      if ((settings.imageMode == 1 && !canDownload) || (settings.imageMode == 0 && !hasPicture)) {
+      if ((settings.imageMode != 0 && !canDownload) || (settings.imageMode == 0 && !hasPicture)) {
          Serial.println("[MAIN] Not set up: nothing to download and no pictures in the gallery.");
          if (!hasPicture) { // a stored picture stays on the display
             showNotice(DISPLAY_SETUP_HINT, "Not set up: press button, connect via Bluetooth",
                        "paperlesspaper.github.io/paperlesspaper-firmware-offline");
          }
 
-         const bool pollSettings = settings.imageMode == 1 && wifiSettings.ssid.length() > 0 && settings.settingsUrl.length() > 0;
+         const bool pollSettings = settings.imageMode != 0 && wifiSettings.ssid.length() > 0 && settings.settingsUrl.length() > 0;
          const int regularSleep = (settings.timeout > 0) ? systemData.sleepPrediction : DEFAULT_SLEEP;
          gotToDeepSleep(pollSettings ? max(60, regularSleep) : 0, false, false);
       }
@@ -4012,7 +4280,7 @@ void loop() {
          gotToDeepSleep(Gallery::autoSwitch() ? gallerySleep : 0, false, false);
       }
 
-      // URL mode
+      // URL mode or Immich
       dlSuccess = processHttpDownload(fileName);
       waitDisplayComplete(false);
       delay(25);
@@ -4022,7 +4290,7 @@ void loop() {
          WiFi.disconnect(true);
          logImageSlotCrc(fileName.c_str());
          setSuccess = showStoredImage(fileName);
-         if (setSuccess == 0) {
+         if (setSuccess == 0 && settings.imageMode == IMAGE_MODE_URL) {
             if (settings.lastModified != tempLastModified) {
                settings.lastModified = tempLastModified;
                saveSettingsToFlash(EEPROM_SETTINGS_ADR);

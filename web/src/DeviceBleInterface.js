@@ -84,6 +84,10 @@ export class DeviceBleInterface {
     this.FIRMWARE_VERSION_UUID = "1000000d-0000-0000-0000-000000000001"; // READ
     this.GALLERY_STATE_UUID = "1000000e-0000-0000-0000-000000000001"; // READ/NOTIFY
     this.READ_DATA_UUID = "1000000f-0000-0000-0000-000000000001"; // READ
+    this.IMMICH_URL_UUID = "10000010-0000-0000-0000-000000000001"; // READ/WRITE
+    this.IMMICH_API_KEY_UUID = "10000011-0000-0000-0000-000000000001"; // WRITE only
+    this.IMMICH_ALBUMS_UUID = "10000012-0000-0000-0000-000000000001"; // READ/WRITE, IDs separated by ","
+    this.immichSupported = false; // the firmware offers Immich (known after readAllSettings)
 
     this.DEVICE_DATA_SERVICE_UUID = "7f74170e-7b0e-11ed-a1eb-0242ac120002";
     this.WIFI_SCAN_UUID = "5131a3fc-7b0e-11ed-a1eb-0242ac120002";
@@ -444,7 +448,20 @@ export class DeviceBleInterface {
 
       const modeChar = await this.settingsService.getCharacteristic(this.MODE_UUID);
       const mode = parseInt(new TextDecoder().decode(await modeChar.readValue()), 10);
-      if (Number.isFinite(mode)) settings.imageMode = mode; // 0 = gallery, 1 = download URL
+      if (Number.isFinite(mode)) settings.imageMode = mode; // 0 = gallery, 1 = download URL, 2 = Immich
+
+      // Immich: only in firmware that offers it. The API key is write-only and never read back.
+      try {
+        const immichUrlChar = await this.settingsService.getCharacteristic(this.IMMICH_URL_UUID);
+        settings.immichUrl = new TextDecoder().decode(await immichUrlChar.readValue()).replace(/\0/g, "");
+        const immichAlbumsChar = await this.settingsService.getCharacteristic(this.IMMICH_ALBUMS_UUID);
+        const albums = new TextDecoder().decode(await immichAlbumsChar.readValue()).replace(/\0/g, "");
+        settings.immichAlbumIds = albums ? albums.split(",") : [];
+        this.immichSupported = true;
+      } catch (e) {
+        this.immichSupported = false;
+      }
+      settings.immichSupported = this.immichSupported;
 
       try {
         const httpAuthUserChar = await this.settingsService.getCharacteristic(this.HTTP_AUTH_USER_UUID);
@@ -724,6 +741,24 @@ export class DeviceBleInterface {
         await settingsUrlChar.writeValue(encoder.encode(settings.settingsUrl || ""));
       } catch (e) {
         console.warn("Alte Firmware: Erweiterte Settings werden ignoriert", e);
+      }
+
+      // Immich (settings.imageMode 2). Written last: writing a download URL above switches the
+      // device to mode 1, the mode written here decides.
+      if (settings.immichUrl !== undefined && this.immichSupported) {
+        const immichUrlChar = await this.settingsService.getCharacteristic(this.IMMICH_URL_UUID);
+        await immichUrlChar.writeValue(encoder.encode(settings.immichUrl || ""));
+        // undefined = keep the key stored on the device
+        if (settings.immichApiKey !== undefined) {
+          const immichKeyChar = await this.settingsService.getCharacteristic(this.IMMICH_API_KEY_UUID);
+          await immichKeyChar.writeValue(encoder.encode(settings.immichApiKey));
+        }
+        const immichAlbumsChar = await this.settingsService.getCharacteristic(this.IMMICH_ALBUMS_UUID);
+        await immichAlbumsChar.writeValue(encoder.encode((settings.immichAlbumIds || []).join(",")));
+      }
+      if (settings.imageMode !== undefined) {
+        const modeChar = await this.settingsService.getCharacteristic(this.MODE_UUID);
+        await modeChar.writeValue(encoder.encode(String(settings.imageMode)));
       }
 
       const cmdChar = await this.settingsService.getCharacteristic(this.UPLOAD_CMD_UUID);

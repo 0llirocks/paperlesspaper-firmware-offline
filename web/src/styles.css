@@ -993,6 +993,15 @@ summary:focus-visible {
   padding: 0 11px;
   background-color: var(--muted-bg);
 }
+textarea.neu-input {
+  height: auto;
+  min-height: calc(var(--control-h) * 2);
+  padding: 10px 12px;
+  resize: vertical;
+}
+textarea.neu-input:focus {
+  padding: 9px 11px;
+}
 .neu-input[aria-invalid="true"] {
   border-color: var(--status-err);
   background-color: var(--tint-err);

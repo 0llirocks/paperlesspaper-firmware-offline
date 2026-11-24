@@ -22,6 +22,7 @@ const DEVICE_LIMITS = {
   wifiSsidBytes: 32, // MAX_WIFI_SSID_LEN
   wifiPassBytes: 64, // MAX_WIFI_PASS_LEN
   settingStringBytes: 128, // MAX_SETTING_STRING_LEN
+  immichAlbums: 10, // MAX_IMMICH_ALBUMS
   timeoutMin: 60, // MIN_SLEEP_TIMEOUT
   timeoutMax: 2592000, // MAX_SLEEP_TIMEOUT (30 days)
   batteryOffMv: 4000, // BAT_OFF_VALUE: below this the device only sleeps when it runs on batteries
@@ -77,7 +78,8 @@ const state = {
   hasImage: false,
   otaMethod: "ble", // "ble" | "serial"
   source: storedSource(), // view "Bild": "gallery" | "url"
-  deviceMode: null, // what the connected device shows: 0 = gallery, 1 = download URL, null = unknown
+  deviceMode: null, // what the connected device shows: 0 = gallery, 1 = download URL, 2 = Immich, null = unknown
+  urlSource: "url", // view "Abruf": "url" (own download URL) | "immich"
   wifiScanning: false,
 };
 
@@ -158,6 +160,9 @@ const settingUrl = $("settingUrl");
 const settingSettingsUrl = $("settingSettingsUrl");
 const settingHttpAuthUser = $("settingHttpAuthUser");
 const settingHttpAuthPassword = $("settingHttpAuthPassword");
+const settingImmichUrl = $("settingImmichUrl");
+const settingImmichApiKey = $("settingImmichApiKey");
+const settingImmichAlbums = $("settingImmichAlbums");
 const settingMotionWakeup = $("settingMotionWakeup");
 const settingChargerMode = $("settingChargerMode");
 const settingAutoRotation = $("settingAutoRotation");
@@ -296,7 +301,13 @@ function syncUi() {
   $("sourceUrl").hidden = state.source !== "url";
   // which of the two the connected device uses
   $("sourceGalleryActive").hidden = !connected || state.deviceMode !== 0;
-  $("sourceUrlActive").hidden = !connected || state.deviceMode !== 1;
+  $("sourceUrlActive").hidden = !connected || !(state.deviceMode >= 1);
+  // Abruf: own URL or Immich
+  $("btnUrlSourceDirect").setAttribute("aria-pressed", String(state.urlSource === "url"));
+  $("btnUrlSourceImmich").setAttribute("aria-pressed", String(state.urlSource === "immich"));
+  document.querySelectorAll("[data-url-source]").forEach((el) => {
+    el.hidden = el.dataset.urlSource !== state.urlSource;
+  });
 
   // Editor
   btnRotate.hidden = !state.hasImage;
@@ -886,11 +897,17 @@ function updateTimeoutHint() {
 bleInterface.onSettingsLoaded = (settings) => {
   if (settings.imageMode !== undefined) {
     // without a URL there is nothing to download: the device then waits for a gallery
-    state.deviceMode = settings.imageMode === 1 && settings.url ? 1 : 0;
+    if (settings.imageMode === 2 && settings.immichUrl) state.deviceMode = 2;
+    else state.deviceMode = settings.imageMode === 1 && settings.url ? 1 : 0;
   }
   // Download settings that were prepared here before connecting are kept: they are what the
   // user wants on the device.
   const keepForm = settingsDirty;
+  if (!keepForm && settings.immichSupported) {
+    settingImmichUrl.value = settings.immichUrl || "";
+    settingImmichAlbums.value = (settings.immichAlbumIds || []).join("\n");
+    state.urlSource = settings.imageMode === 2 ? "immich" : "url";
+  }
   if (settings.url !== undefined && !keepForm) {
     settingUrl.value = settings.url;
     syncBadgeSettings.hidden = false;
@@ -914,18 +931,90 @@ bleInterface.onSettingsLoaded = (settings) => {
   }
 
   updateTimeoutHint();
+  syncUi();
   if (keepForm) return;
-  [settingUrl, settingTimeout, settingSettingsUrl, settingHttpAuthUser, settingHttpAuthPassword].forEach((el) => setFieldError(el, ""));
+  [settingUrl, settingTimeout, settingSettingsUrl, settingHttpAuthUser, settingHttpAuthPassword, settingImmichUrl, settingImmichApiKey, settingImmichAlbums].forEach((el) => setFieldError(el, ""));
   markSettingsDirty(false);
 };
 
-[settingUrl, settingTimeout, settingSettingsUrl, settingHttpAuthUser, settingHttpAuthPassword].forEach((el) => {
+[settingUrl, settingTimeout, settingSettingsUrl, settingHttpAuthUser, settingHttpAuthPassword, settingImmichUrl, settingImmichApiKey, settingImmichAlbums].forEach((el) => {
   el.addEventListener("input", () => {
     setFieldError(el, "");
     markSettingsDirty(true);
   });
 });
 settingTimeout.addEventListener("input", updateTimeoutHint);
+
+function setUrlSource(source) {
+  if (state.urlSource === source) return;
+  state.urlSource = source;
+  markSettingsDirty(true);
+  syncUi();
+}
+$("btnUrlSourceDirect").addEventListener("click", () => setUrlSource("url"));
+$("btnUrlSourceImmich").addEventListener("click", () => setUrlSource("immich"));
+
+// --- Immich ---
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Album IDs from the album field: IDs or album links ("https://host/albums/<id>"), separated by
+ * line breaks, commas, semicolons or spaces. Same rules as Immich::parseAlbumList() in the firmware.
+ * Returns { ids, base, error }: base is the server of the first link (to fill in the server field).
+ */
+function parseImmichAlbums(text) {
+  const ids = [];
+  let base = "";
+  for (const entry of text.split(/[\s,;]+/).filter(Boolean)) {
+    let id = entry;
+    const at = entry.indexOf("/albums/");
+    if (at >= 0) {
+      id = entry.slice(at + 8, at + 8 + 36);
+      if (!base && /^https?:\/\//i.test(entry)) base = entry.slice(0, at);
+    }
+    id = id.toLowerCase();
+    if (!UUID_RE.test(id)) return { ids: [], base, error: `„${entry}“ ist kein Album-Link und keine Album-ID.` };
+    if (!ids.includes(id)) ids.push(id);
+  }
+  if (ids.length > DEVICE_LIMITS.immichAlbums) return { ids: [], base, error: `Höchstens ${DEVICE_LIMITS.immichAlbums} Alben (eingegeben: ${ids.length}).` };
+  return { ids, base, error: "" };
+}
+
+/** "https://photos.example/api/" -> "https://photos.example", like Immich::baseUrl() */
+function immichBaseUrl(url) {
+  return url
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/api$/i, "")
+    .replace(/\/+$/, "");
+}
+
+// A pasted album link also tells the server.
+settingImmichAlbums.addEventListener("change", () => {
+  const { base } = parseImmichAlbums(settingImmichAlbums.value);
+  if (base && !settingImmichUrl.value.trim()) settingImmichUrl.value = immichBaseUrl(base);
+});
+
+function validateImmichFields() {
+  if (state.urlSource !== "immich") return true;
+  settingImmichUrl.value = immichBaseUrl(settingImmichUrl.value);
+  let ok = validateUrlField(settingImmichUrl);
+  if (ok && !settingImmichUrl.value) {
+    setFieldError(settingImmichUrl, "Bitte die Adresse des Immich-Servers eingeben.");
+    ok = false;
+  }
+  if (!validateLengthField(settingImmichApiKey, "Der API-Key")) ok = false;
+  const albums = parseImmichAlbums(settingImmichAlbums.value);
+  if (albums.error || !albums.ids.length) {
+    setFieldError(settingImmichAlbums, albums.error || "Bitte mindestens ein Album eingeben.");
+    ok = false;
+  } else {
+    setFieldError(settingImmichAlbums, "");
+    settingImmichAlbums.value = albums.ids.join("\n");
+  }
+  return ok;
+}
 
 function validateUrlField(input) {
   const value = input.value.trim();
@@ -972,7 +1061,7 @@ function validateTimeoutField() {
 
 function validateSettingsForm() {
   // run all checks so that every invalid field is marked
-  const results = [validateUrlField(settingUrl), validateTimeoutField(), validateUrlField(settingSettingsUrl), validateLengthField(settingHttpAuthUser, "Der Benutzername"), validateLengthField(settingHttpAuthPassword, "Das Passwort")];
+  const results = [validateUrlField(settingUrl), validateTimeoutField(), validateUrlField(settingSettingsUrl), validateLengthField(settingHttpAuthUser, "Der Benutzername"), validateLengthField(settingHttpAuthPassword, "Das Passwort"), validateImmichFields()];
   return results.every(Boolean);
 }
 
@@ -998,15 +1087,28 @@ async function saveDeviceSettings() {
     autoRotation: settingAutoRotation.checked,
     settingsUrl: settingSettingsUrl.value,
   };
+  const immich = state.urlSource === "immich";
+  if (immich && !bleInterface.immichSupported) {
+    setStatus("Die Firmware auf dem E-Paper kennt Immich noch nicht. Bitte zuerst die Offline Firmware aktualisieren.", "err");
+    return false;
+  }
+  if (bleInterface.immichSupported) {
+    settings.immichUrl = settingImmichUrl.value;
+    // The device does not reveal its key: an empty field keeps the stored one.
+    settings.immichApiKey = settingImmichApiKey.value !== "" ? settingImmichApiKey.value : undefined;
+    settings.immichAlbumIds = parseImmichAlbums(settingImmichAlbums.value).ids;
+    settings.imageMode = immich ? 2 : settings.url ? 1 : undefined;
+  }
+  const download = immich || Boolean(settings.url);
 
-  // A download URL replaces the gallery on the device.
+  // A download URL (or Immich) replaces the gallery on the device.
   const stored = Number(gallery.deviceState?.count) || 0;
-  const replacesGallery = Boolean(settings.url) && state.deviceMode !== 1 && bleInterface.gallerySupported && stored > 0;
+  const replacesGallery = download && !(state.deviceMode >= 1) && bleInterface.gallerySupported && stored > 0;
   if (replacesGallery) {
     const confirmed = await showMessage({
-      title: "Auf Abruf per URL umstellen?",
+      title: immich ? "Auf Immich umstellen?" : "Auf Abruf per URL umstellen?",
       tone: "warn",
-      text: `Das E-Paper zeigt dann das Bild der Download-URL. Die ${pictures(stored)} der Galerie werden vom Gerät gelöscht (in diesem Browser bleiben sie erhalten). Als Intervall gilt das Aktualisierungs-Intervall von hier, nicht mehr der Bildwechsel der Galerie.`,
+      text: `Das E-Paper zeigt dann ${immich ? "zufällige Fotos aus Immich" : "das Bild der Download-URL"}. Die ${pictures(stored)} der Galerie werden vom Gerät gelöscht (in diesem Browser bleiben sie erhalten). Als Intervall gilt das Aktualisierungs-Intervall von hier, nicht mehr der Bildwechsel der Galerie.`,
       okLabel: "Umstellen",
       cancelLabel: "Abbrechen",
       okVariant: "danger",
@@ -1026,7 +1128,9 @@ async function saveDeviceSettings() {
   }
 
   if (success) {
-    if (settings.url) state.deviceMode = 1; // a stored URL switches the device to the download
+    if (immich) state.deviceMode = 2;
+    else if (settings.url) state.deviceMode = 1; // a stored URL switches the device to the download
+    settingImmichApiKey.value = "";
     if (replacesGallery) {
       try {
         await bleInterface.galleryClear();
@@ -1040,7 +1144,7 @@ async function saveDeviceSettings() {
     setGalleryInterval(settings.timeout || "3600");
     intervalDirty = false;
     renderGallery();
-    if (settings.url) offerToStartDownload(); // not awaited: the caller goes on with the result
+    if (download) offerToStartDownload(); // not awaited: the caller goes on with the result
   } else if (!bleInterface.isConnected) {
     setStatus("Nicht gespeichert: Das E-Paper ist nicht verbunden.", "err");
   }
@@ -1149,8 +1253,17 @@ $("btnApplyJson").addEventListener("click", async () => {
   const chargerIgnored = Boolean(tempJsonSettings.chargerMode) && !settingChargerMode.checked;
   if (tempJsonSettings.chargerMode === false) settingChargerMode.checked = false;
   if (tempJsonSettings.autoRotation !== undefined) settingAutoRotation.checked = Boolean(tempJsonSettings.autoRotation);
+  // Like the device: a download URL switches to the URL, imageMode 1 or 2 decides last.
+  if (tempJsonSettings.downloadUrl) state.urlSource = "url";
+  if (typeof tempJsonSettings.immichUrl === "string") settingImmichUrl.value = tempJsonSettings.immichUrl;
+  if (typeof tempJsonSettings.immichApiKey === "string") settingImmichApiKey.value = tempJsonSettings.immichApiKey;
+  const albums = tempJsonSettings.immichAlbumIds;
+  if (Array.isArray(albums) || typeof albums === "string") settingImmichAlbums.value = (Array.isArray(albums) ? albums : [albums]).join("\n");
+  if (tempJsonSettings.imageMode === 1) state.urlSource = "url";
+  if (tempJsonSettings.imageMode === 2) state.urlSource = "immich";
   updateTimeoutHint();
   markSettingsDirty(true);
+  syncUi();
 
   const saved = await syncUrlSettings();
   if (saved && chargerIgnored) {
@@ -2165,7 +2278,7 @@ async function showPicture(id) {
 
 /** "Anzeigen" is offered for a picture the connected device holds and does not show. */
 function canShow(id, shownId) {
-  return bleInterface.isConnected && bleInterface.gallerySupported && id !== showingId && (id !== shownId || state.deviceMode === 1);
+  return bleInterface.isConnected && bleInterface.gallerySupported && id !== showingId && (id !== shownId || state.deviceMode >= 1);
 }
 
 /** The display shows this picture of the device now. It stays until the next change is due. */
@@ -2297,7 +2410,7 @@ function renderGalleryDevice(display) {
       if (pending.length) line += ` Zu übertragen: ${pictures(pending.length)}${bytes ? ` (${formatBytes(bytes)})` : ""}.`;
       if (bytes > free) line += " Das passt nicht ganz auf das Gerät.";
     }
-    if (state.deviceMode === 1) line += " Derzeit zeigt das E-Paper das Bild der Download-URL; Synchronisieren stellt es auf die Galerie um.";
+    if (state.deviceMode >= 1) line += ` Derzeit zeigt das E-Paper ${state.deviceMode === 2 ? "Fotos aus Immich" : "das Bild der Download-URL"}; Synchronisieren stellt es auf die Galerie um.`;
     text.textContent = line;
     if (used + free > 0) {
       const percent = Math.round((used / (used + free)) * 100);
@@ -2607,7 +2720,7 @@ let offerSyncAfterList = false;
 async function offerSync() {
   if (!offerSyncAfterList) return;
   offerSyncAfterList = false;
-  if (state.busy || state.deviceMode === 1 || !gallery.items.length || document.querySelector("dialog[open]")) return;
+  if (state.busy || state.deviceMode >= 1 || !gallery.items.length || document.querySelector("dialog[open]")) return;
   const plan = gallery.plan(currentDisplay());
   const changes = plan.puts.length + plan.deletes.length + (plan.order ? 1 : 0);
   if (!changes) return;

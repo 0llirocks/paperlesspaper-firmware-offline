@@ -108,6 +108,21 @@ Details:
 - **Motion wake-up (optional):** the frame also updates when it is moved.
 - **Low battery:** below 4.0 V (4 AA cells) without USB power the frame skips updates to protect the batteries. It says so once on the display.
 
+### Immich
+
+Instead of a download URL the frame can show a random photo from your [Immich](https://immich.app/) server. In the Web UI choose **Abruf per URL → Immich** and enter the server, an API key and up to 10 albums (album links copied from the Immich web app, or album IDs). At every wake-up the frame:
+
+1. counts the photos of each album (`POST /api/search/statistics`, only with more than one album) and draws an album by its number of photos, so every photo is equally likely,
+2. asks for random photos of that album (`POST /api/search/random`) and takes one that was not shown last time,
+3. downloads its preview (`GET /api/assets/<id>/thumbnail?size=preview`) and fits and dithers it like any JPEG.
+
+Immich treats several albums in one search as "in all of these albums", which is why the frame draws the album itself.
+
+- **API key:** create it in Immich under *Account Settings → API Keys*. Permissions: `asset.read`, `asset.view`, and `asset.statistics` for more than one album (without it every album is equally likely). The key is sent as `x-api-key`; it can be written but not read back over Bluetooth.
+- **Preview format:** the previews must be JPEG and not progressive (Immich *Administration → Settings → Image Settings*). WebP previews are refused, progressive JPEGs are shown at 1/8 of their resolution.
+- **Server URL:** `http://` or `https://`, up to 128 characters, the address of the web app (a trailing `/api` is removed). HTTPS certificates are not verified. The device status headers are not sent to Immich.
+- **Errors**, **interval**, **motion wake-up** and **low battery** work as for the WiFi download. The serial log (`[IMMICH] …`) names the cause, e.g. an invalid key (401), a missing permission (403) or an empty album.
+
 ### Device status headers
 
 The frame sends its status as request headers with every request to the image URL and to the Settings-JSON-URL. A server can record them without waking the frame an extra time.
@@ -150,6 +165,9 @@ Enter a **Settings-JSON-URL** in the Web UI to manage the frame from your server
 | `timeout` | Update interval in seconds (60–2592000) |
 | `downloadUrl` | Image URL. Switches the frame to WiFi download. |
 | `httpAuthUser`, `httpAuthPassword` | HTTP Basic Auth for the image download |
+| `immichUrl`, `immichApiKey` | Immich server and API key, see [Immich](#immich) |
+| `immichAlbumIds` | Immich albums: an array of up to 10 album IDs (or album links), or one string separated by commas. An invalid list is ignored. |
+| `imageMode` | `1` = download URL, `2` = Immich. Applied after `downloadUrl`. `0` (gallery) is not accepted here. |
 | `motionWakeup` | Update when the frame is moved |
 | `autoRotation` | Rotate the image according to the orientation sensor |
 | `chargerMode` | `false` switches charging over USB-C off. `true` is ignored: charging normal batteries is dangerous, so it can only be switched on in the Web UI (**Gerät**), which asks whether NiMH batteries are inserted. |
@@ -246,7 +264,7 @@ UUID suffix: `-0000-0000-0000-000000000001`.
 | UUID | Name | Properties | Notes |
 | :--- | :--- | :--- | :--- |
 | `10000001` | Download URL | read, write | A non-empty URL sets the image mode to `1`. |
-| `10000002` | Image mode | read, write | `0` = gallery, `1` = download from URL |
+| `10000002` | Image mode | read, write | `0` = gallery, `1` = download from URL, `2` = Immich |
 | `10000003` | Upload data | write, write without response | Binary data for gallery and firmware uploads |
 | `10000004` | Upload command | read, write | Commands and upload status, see below |
 | `10000005` | Timeout | read, write | Update interval in seconds, 60–2592000 |
@@ -259,8 +277,11 @@ UUID suffix: `-0000-0000-0000-000000000001`.
 | `1000000d` | Firmware version | read | Version of the running firmware |
 | `1000000e` | Gallery state | read, notify | JSON, see [Gallery](#gallery-1) below |
 | `1000000f` | Read data | read | Next chunk (up to 500 bytes) of the stream opened with `READ:…` |
+| `10000010` | Immich URL | read, write | Address of the Immich server |
+| `10000011` | Immich API key | write | Never read back |
+| `10000012` | Immich albums | read, write | Up to 10 album IDs separated by `,` (369 characters). An invalid list is ignored. |
 
-Texts (URLs, HTTP user and password) may be up to 128 characters long. Longer values and timeouts outside the range are ignored. Send `SAVE_SETTINGS` to store the written values permanently.
+Texts (URLs, HTTP user and password, Immich API key) may be up to 128 characters long. Longer values and timeouts outside the range are ignored. Send `SAVE_SETTINGS` to store the written values permanently.
 
 </details>
 
@@ -426,4 +447,3 @@ A merge of `dev` into `main` is not tested twice: if `main` has exactly the file
 ## Roadmap
 
 - Download a gallery from a URL
-- [Immich](https://immich.app/) integration

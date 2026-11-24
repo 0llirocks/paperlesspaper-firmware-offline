@@ -355,6 +355,66 @@ def test_save_settings(app_session):
     run(body())
 
 
+ALBUM_A = "0b1c2d3e-4f50-4617-8899-aabbccddeeff"
+ALBUM_B = "11111111-2222-4333-8444-555555555555"
+
+
+def test_save_immich_settings(app_session):
+    """Immich: server, API key and albums go to the device, which then shows Immich (mode 2). An
+    album link becomes an ID and fills in the server. The key is write-only: an empty field keeps it."""
+
+    async def body():
+        device = SimulatedDevice()
+        async with app_session(device) as (app, site):
+            await app.connect()
+            await app.url_settings()
+            page = app.page
+            await app.click("#btnUrlSourceImmich")
+            row_hidden = "id => document.getElementById(id).closest('.field').hidden"
+            assert await page.evaluate(row_hidden, "settingUrl")  # the own URL is not asked for
+            assert not await page.evaluate(row_hidden, "settingImmichUrl")
+
+            # not an album: refused, nothing sent
+            await page.fill("#settingImmichUrl", "https://photos.example")
+            await page.fill("#settingImmichAlbums", "kein-album")
+            await app.click("#btnSaveSettings")
+            await app.wait_status("Bitte die markierten Felder korrigieren")
+            assert not await hidden(app, "#settingImmichAlbumsError")
+            assert "SAVE_SETTINGS" not in device.commands
+
+            await page.fill("#settingImmichUrl", "")
+            await page.fill("#settingImmichAlbums", f"https://photos.example/albums/{ALBUM_A}\n{ALBUM_B.upper()}\n{ALBUM_A}")
+            await page.dispatch_event("#settingImmichAlbums", "change")
+            assert await page.input_value("#settingImmichUrl") == "https://photos.example"
+            await page.fill("#settingImmichApiKey", "key-123")
+            await app.click("#btnSaveSettings")
+            await app.wait_status("Einstellungen gespeichert")
+            await app.confirm(accept=False)  # stay connected
+
+            saved = device.saved_settings
+            assert saved["image_mode"] == 2
+            assert (saved["immich_url"], saved["immich_api_key"]) == ("https://photos.example", "key-123")
+            assert saved["immich_albums"] == [ALBUM_A, ALBUM_B]
+
+            await page.fill("#settingTimeout", "1200")
+            await app.click("#btnSaveSettings")
+            await until(lambda: device.commands.count("SAVE_SETTINGS") == 2)
+            await app.confirm(accept=False)
+            assert device.saved_settings["immich_api_key"] == "key-123"
+            assert device.saved_settings["image_mode"] == 2
+
+            # back to the own URL
+            await app.click("#btnUrlSourceDirect")
+            await page.fill("#settingUrl", site.url + "picture.bmp")
+            await app.click("#btnSaveSettings")
+            await until(lambda: device.commands.count("SAVE_SETTINGS") == 3)
+            await app.confirm(accept=False)
+            assert device.saved_settings["image_mode"] == 1
+            assert device.saved_settings["immich_albums"] == [ALBUM_A, ALBUM_B]  # kept for later
+
+    run(body())
+
+
 @pytest.mark.parametrize("field, value, error", [
     ("#settingUrl", "ftp://frame.local/picture.jpg", "#settingUrlError"),
     ("#settingUrl", "http://frame.local/" + "a" * 120, "#settingUrlError"),

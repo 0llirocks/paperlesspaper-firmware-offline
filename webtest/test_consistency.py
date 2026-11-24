@@ -73,6 +73,7 @@ LIMITS = {
     "MIN_SLEEP_TIMEOUT": "timeoutMin",
     "MAX_SLEEP_TIMEOUT": "timeoutMax",
     "BAT_OFF_VALUE": "batteryOffMv",
+    "MAX_IMMICH_ALBUMS": "immichAlbums",
 }
 
 
@@ -83,6 +84,15 @@ def test_setting_limit(name):
         f"web UI (DEVICE_LIMITS.{LIMITS[name]})": web_limit(LIMITS[name]),
         "simulated device": getattr(simdevice, name),
     })
+
+
+def test_immich_album_list_length():
+    """The album list is stored in one EEPROM slot: 10 IDs of 36 characters and 9 commas."""
+    albums = firmware_define("MAX_IMMICH_ALBUMS")
+    length = firmware_define("MAX_IMMICH_ALBUMS_LEN")
+    assert length == albums * 36 + albums - 1
+    assert_equal("MAX_IMMICH_ALBUMS_LEN", {"firmware": length, "simulated device": simdevice.MAX_IMMICH_ALBUMS_LEN})
+    assert length <= simdevice.USB_LINK_MAX_PAYLOAD, "The album list must fit into one characteristic value."
 
 
 GALLERY_CONSTANTS = [

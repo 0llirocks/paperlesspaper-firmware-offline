@@ -113,6 +113,9 @@ struct Settings
    String settingsUrl;
    String settingsLastModified;
    bool autoRotation;
+   String immichUrl;      // base URL of the Immich server
+   String immichApiKey;   // never sent back over Bluetooth
+   String immichAlbumIds; // album IDs separated by ',' (Immich::parseAlbumList)
    bool forceDownload;
    bool skipSetupMode;
 };
