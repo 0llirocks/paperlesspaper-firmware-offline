@@ -62,9 +62,12 @@ static void test_base_url() {
 }
 
 static void test_bodies() {
+   TEST_ASSERT_EQUAL_STRING("{\"filter\":{\"albumIds\":{\"any\":[\"0b1c2d3e-4f50-4617-8899-aabbccddeeff\",\"11111111-2222-4333-8444-555555555555\"]},"
+                            "\"type\":{\"eq\":\"IMAGE\"}},\"size\":10,\"withExif\":false,\"withPeople\":false}",
+                            Immich::randomSearchBody({A, B}, 10).c_str());
    TEST_ASSERT_EQUAL_STRING("{\"albumIds\":[\"0b1c2d3e-4f50-4617-8899-aabbccddeeff\"],\"type\":\"IMAGE\",\"size\":2,\"withExif\":false,\"withPeople\":false}",
-                            Immich::randomSearchBody(A, 2).c_str());
-   TEST_ASSERT_EQUAL_STRING("{\"albumIds\":[\"0b1c2d3e-4f50-4617-8899-aabbccddeeff\"],\"type\":\"IMAGE\"}", Immich::statisticsBody(A).c_str());
+                            Immich::legacyRandomSearchBody(A, 2).c_str());
+   TEST_ASSERT_EQUAL_STRING("{\"albumIds\":[\"0b1c2d3e-4f50-4617-8899-aabbccddeeff\"],\"type\":\"IMAGE\"}", Immich::legacyStatisticsBody(A).c_str());
    TEST_ASSERT_EQUAL_STRING("/api/assets/0b1c2d3e-4f50-4617-8899-aabbccddeeff/thumbnail?size=preview", Immich::previewPath(A).c_str());
 }
 
@@ -81,17 +84,42 @@ static void test_pick_weighted() {
 
 static void test_parse_assets() {
    // shortened answer of /api/search/random: an array of assets
-   const std::string json = std::string("[{\"id\":\"") + A + "\",\"type\":\"IMAGE\",\"owner\":{\"name\":\"x\"},\"exifInfo\":null}," +
-                            "{\"id\":\"" + B + "\",\"type\":\"IMAGE\"},{\"id\":\"not-an-id\"}]";
-   std::vector<std::string> ids;
-   TEST_ASSERT_TRUE(Immich::parseAssetIds(json.c_str(), json.size(), ids));
-   TEST_ASSERT_EQUAL(2, ids.size());
-   TEST_ASSERT_EQUAL_STRING(A, ids[0].c_str());
+   const std::string json = std::string("[{\"id\":\"") + A + "\",\"type\":\"IMAGE\",\"width\":4032,\"height\":3024,\"owner\":{\"name\":\"x\"},\"exifInfo\":null}," +
+                            "{\"id\":\"" + B + "\",\"type\":\"IMAGE\",\"width\":null,\"height\":null},{\"id\":\"not-an-id\"}]";
+   std::vector<Immich::Asset> assets;
+   TEST_ASSERT_TRUE(Immich::parseAssets(json.c_str(), json.size(), assets));
+   TEST_ASSERT_EQUAL(2, assets.size());
+   TEST_ASSERT_EQUAL_STRING(A, assets[0].id.c_str());
+   TEST_ASSERT_EQUAL_UINT32(4032, assets[0].width);
+   TEST_ASSERT_EQUAL_UINT32(3024, assets[0].height);
+   TEST_ASSERT_EQUAL_UINT32(0, assets[1].width); // not known yet
 
-   TEST_ASSERT_TRUE(Immich::parseAssetIds("[]", 2, ids));
-   TEST_ASSERT_EQUAL(0, ids.size());
-   TEST_ASSERT_FALSE(Immich::parseAssetIds("{\"message\":\"x\"}", 15, ids));
-   TEST_ASSERT_FALSE(Immich::parseAssetIds("[{", 2, ids));
+   TEST_ASSERT_TRUE(Immich::parseAssets("[]", 2, assets));
+   TEST_ASSERT_EQUAL(0, assets.size());
+   TEST_ASSERT_FALSE(Immich::parseAssets("{\"message\":\"x\"}", 15, assets));
+   TEST_ASSERT_FALSE(Immich::parseAssets("[{", 2, assets));
+}
+
+static Immich::Asset asset(const char *id, uint32_t width, uint32_t height) {
+   Immich::Asset a;
+   a.id = id;
+   a.width = width;
+   a.height = height;
+   return a;
+}
+
+static void test_suits_display() {
+   // 7.3": 800 x 480 (landscape)
+   TEST_ASSERT_TRUE(Immich::suitsDisplay(asset(A, 4032, 3024), 800, 480));  // 4:3
+   TEST_ASSERT_TRUE(Immich::suitsDisplay(asset(A, 1920, 1080), 800, 480));  // 16:9
+   TEST_ASSERT_FALSE(Immich::suitsDisplay(asset(A, 3024, 4032), 800, 480)); // portrait
+   TEST_ASSERT_FALSE(Immich::suitsDisplay(asset(A, 3000, 3000), 800, 480)); // square
+   TEST_ASSERT_FALSE(Immich::suitsDisplay(asset(A, 6000, 1500), 800, 480)); // panorama
+   TEST_ASSERT_FALSE(Immich::suitsDisplay(asset(A, 0, 0), 800, 480));       // unknown
+   // 13.3": 1200 x 1600 (portrait)
+   TEST_ASSERT_TRUE(Immich::suitsDisplay(asset(A, 3024, 4032), 1200, 1600));
+   TEST_ASSERT_TRUE(Immich::suitsDisplay(asset(A, 1080, 1920), 1200, 1600)); // phone, 9:16
+   TEST_ASSERT_FALSE(Immich::suitsDisplay(asset(A, 4032, 3024), 1200, 1600));
 }
 
 static void test_parse_statistics() {
@@ -103,10 +131,23 @@ static void test_parse_statistics() {
 }
 
 static void test_choose_asset() {
-   TEST_ASSERT_EQUAL_STRING(B, Immich::chooseAsset({A, B}, A).c_str());
-   TEST_ASSERT_EQUAL_STRING(A, Immich::chooseAsset({A, B}, "").c_str());
-   TEST_ASSERT_EQUAL_STRING(A, Immich::chooseAsset({A}, A).c_str()); // the only picture of the album
-   TEST_ASSERT_EQUAL_STRING("", Immich::chooseAsset({}, A).c_str());
+   static const char *C = "22222222-3333-4444-8555-666666666666";
+   const Immich::Asset portrait = asset(A, 3024, 4032), landscape = asset(B, 4032, 3024), square = asset(C, 3000, 3000);
+
+   // the first suitable picture, not the first one
+   TEST_ASSERT_EQUAL(1, Immich::chooseAsset({portrait, landscape}, "", 800, 480));
+   TEST_ASSERT_EQUAL(0, Immich::chooseAsset({portrait, landscape}, "", 1200, 1600));
+   // not the picture shown last time, even if it suits ...
+   TEST_ASSERT_EQUAL(2, Immich::chooseAsset({portrait, landscape, asset(C, 1920, 1080)}, B, 800, 480));
+   // ... then rather the closest of the others: a square comes closer to 5:3 than a portrait
+   TEST_ASSERT_EQUAL(2, Immich::chooseAsset({portrait, landscape, square}, B, 800, 480));
+   // nothing suits: the closest one
+   TEST_ASSERT_EQUAL(1, Immich::chooseAsset({portrait, square}, "", 800, 480));
+   // unknown sizes: the first one that is not the last picture
+   TEST_ASSERT_EQUAL(1, Immich::chooseAsset({asset(A, 0, 0), asset(B, 0, 0)}, A, 800, 480));
+   // the only picture of the albums
+   TEST_ASSERT_EQUAL(0, Immich::chooseAsset({landscape}, B, 800, 480));
+   TEST_ASSERT_EQUAL(-1, Immich::chooseAsset({}, A, 800, 480));
 }
 
 int main(int, char **) {
@@ -118,6 +159,7 @@ int main(int, char **) {
    RUN_TEST(test_bodies);
    RUN_TEST(test_pick_weighted);
    RUN_TEST(test_parse_assets);
+   RUN_TEST(test_suits_display);
    RUN_TEST(test_parse_statistics);
    RUN_TEST(test_choose_asset);
    return UNITY_END();

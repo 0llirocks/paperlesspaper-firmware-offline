@@ -267,14 +267,14 @@
                                         <svg class="icon" aria-hidden="true"><use href="#i-eye" /></svg>
                                     </button>
                                 </div>
-                                <p class="field-hint" id="settingImmichApiKeyHint">In Immich unter Konto-Einstellungen → API-Schlüssel anlegen. Nötige Rechte: asset.read, asset.view und (bei mehreren Alben) asset.statistics. Das Gerät gibt den Key nicht zurück.</p>
+                                <p class="field-hint" id="settingImmichApiKeyHint">In Immich unter Konto-Einstellungen → API-Schlüssel anlegen. Nötige Rechte: asset.read und asset.view (Immich vor 3.2 mit mehreren Alben zusätzlich asset.statistics). Das Gerät gibt den Key nicht zurück.</p>
                                 <p class="field-error" id="settingImmichApiKeyError" role="alert" hidden></p>
                             </div>
 
                             <div class="field" data-url-source="immich" hidden>
                                 <label class="form-label" for="settingImmichAlbums">Alben</label>
                                 <textarea id="settingImmichAlbums" class="neu-input" rows="3" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Album-Link oder Album-ID, eine pro Zeile" aria-describedby="settingImmichAlbumsHint settingImmichAlbumsError"></textarea>
-                                <p class="field-hint" id="settingImmichAlbumsHint">Bis zu 10 Alben. Link aus Immich: Album öffnen und die Adresse aus der Adresszeile kopieren. Jedes Foto aller Alben kommt gleich oft an die Reihe. Vorschaubilder müssen in Immich als JPEG (nicht progressiv) eingestellt sein.</p>
+                                <p class="field-hint" id="settingImmichAlbumsHint">Bis zu 10 Alben. Link aus Immich: Album öffnen und die Adresse aus der Adresszeile kopieren. Jedes Foto aller Alben kommt gleich oft an die Reihe, bevorzugt Fotos im Format des Displays (7,3": quer, 13,3": hoch). Vorschaubilder müssen in Immich als JPEG (nicht progressiv) eingestellt sein.</p>
                                 <p class="field-error" id="settingImmichAlbumsError" role="alert" hidden></p>
                             </div>
 
@@ -1305,7 +1305,7 @@
                     </div>
                     <div class="def-row">
                         <dt>Immich</dt>
-                        <dd>Statt einer eigenen URL holt das Gerät bei jedem Aufwachen ein zufälliges Foto aus bis zu 10 Alben deines Immich-Servers. Jedes Foto kommt gleich oft an die Reihe, dasselbe nie zweimal hintereinander. Der API-Key braucht die Rechte asset.read, asset.view und (bei mehreren Alben) asset.statistics. Vorschaubilder müssen in Immich als JPEG eingestellt sein, nicht als WebP und nicht progressiv.</dd>
+                        <dd>Statt einer eigenen URL holt das Gerät bei jedem Aufwachen ein zufälliges Foto aus bis zu 10 Alben deines Immich-Servers. Jedes Foto kommt gleich oft an die Reihe, dasselbe nie zweimal hintereinander. Das Gerät nimmt bevorzugt Fotos im Format seines Displays (7,3": quer, 13,3": hoch), damit keine breiten weißen Ränder bleiben; Immich selbst kann nicht nach Format suchen, darum wählt das Gerät aus 10 zufälligen Fotos aus. Der API-Key braucht die Rechte asset.read und asset.view (Immich vor 3.2 mit mehreren Alben zusätzlich asset.statistics). Vorschaubilder müssen in Immich als JPEG eingestellt sein, nicht als WebP und nicht progressiv.</dd>
                     </div>
                     <div class="def-row">
                         <dt>Intervall</dt>

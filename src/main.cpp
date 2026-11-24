@@ -213,6 +213,11 @@ SdFs sd;
 RTC_DATA_ATTR timeval previousWakeup = timeval{.tv_sec = 0, .tv_usec = 0};
 RTC_DATA_ATTR uint8_t failedUpdates = 0;
 RTC_DATA_ATTR char immichLastAsset[Immich::ID_LEN + 1] = ""; // not shown twice in a row
+// Search shape of the Immich server: 0 = not known yet, 1 = "filter" (Immich 3.2 and later),
+// 2 = the flat fields of older versions. Kept over deep sleep; new Immich settings set it back to 0.
+RTC_DATA_ATTR uint8_t immichSearchShape = 0;
+#define IMMICH_SHAPE_FILTER 1
+#define IMMICH_SHAPE_LEGACY 2
 // What the setup mode had done when the frame restarted itself for the update (see setup()).
 // Not initialised at a restart: valid only with RESUME_MAGIC in its upper half.
 RTC_NOINIT_ATTR uint32_t resumeState;
@@ -1851,6 +1856,7 @@ void gattWrite(NimBLECharacteristic *pCharacteristic) {
       if (!bleValueFits(attrVal, MAX_SETTING_STRING_LEN, "Immich URL"))
          return;
       settings.immichUrl = attrVal.c_str();
+      immichSearchShape = 0; // perhaps another server
       Serial.printf("[BLE] Set Immich URL: %s\n", settings.immichUrl.c_str());
    }
    else if (uuidStr == "10000011-0000-0000-0000-000000000001") {
@@ -3184,6 +3190,7 @@ bool resetAll(bool resetWifi) {
    settings.immichApiKey = "";
    settings.immichAlbumIds = "";
    immichLastAsset[0] = '\0';
+   immichSearchShape = 0;
    settings.chargerMode = false; // after a reset the charger is off until the user switches it on again
    chargeMode(false);
    if (resetWifi) {
@@ -3661,29 +3668,18 @@ static int immichPost(const String &base, const char *path, const std::string &b
    return code;
 }
 
-// Random picture of the Immich albums, saved as `fileName`. Every picture of all albums is equally
-// likely: the album is drawn by its number of pictures. Results as loadImageFromWeb().
-int loadImageFromImmich(const String &fileName) {
-   std::vector<std::string> albums;
-   Immich::parseAlbumList(settings.immichAlbumIds.c_str(), albums);
-   if (settings.immichUrl.length() == 0 || settings.immichApiKey.length() == 0 || albums.empty()) {
-      Serial.println("[IMMICH] Not set up: the URL, the API key and at least one album are needed");
-      return DL_HTTP_STATUS;
-   }
-   const String base = Immich::baseUrl(settings.immichUrl.c_str()).c_str();
-   String answer;
-   int code = 0;
-
+// Random search of older Immich versions: several albumIds would only find pictures that are in
+// all of them, so the album is drawn here by its number of pictures. Returns the HTTP status.
+static int immichLegacySearch(const String &base, const std::vector<std::string> &albums, String &answer) {
    size_t album = 0;
    if (albums.size() > 1) {
-      // Several albumIds in one search would only find pictures that are in all of them.
       std::vector<uint32_t> counts;
       for (const std::string &id : albums) {
          uint32_t total = 0;
-         code = immichPost(base, "/api/search/statistics", Immich::statisticsBody(id), answer);
+         const int code = immichPost(base, "/api/search/statistics", Immich::legacyStatisticsBody(id), answer);
          if (code < 0) {
             immichLogStatus("Counting the pictures", code);
-            return DL_REQUEST_FAILED;
+            return code;
          }
          if (code != HTTP_CODE_OK || !Immich::parseStatisticsTotal(answer.c_str(), answer.length(), total)) {
             immichLogStatus("Counting the pictures", code);
@@ -3693,11 +3689,11 @@ int loadImageFromImmich(const String &fileName) {
          counts.push_back(total);
       }
       if (counts.size() == albums.size()) {
-         const uint64_t pick = ((uint64_t)esp_random() << 32) | esp_random();
-         const int picked = Immich::pickWeighted(counts, pick);
+         const int picked = Immich::pickWeighted(counts, ((uint64_t)esp_random() << 32) | esp_random());
          if (picked < 0) {
             Serial.println("[IMMICH] The albums contain no pictures");
-            return DL_HTTP_STATUS;
+            answer = "[]";
+            return HTTP_CODE_OK;
          }
          album = (size_t)picked;
          Serial.printf("[IMMICH] %llu pictures in %u albums\n", (unsigned long long)Immich::sum(counts), (unsigned)albums.size());
@@ -3707,23 +3703,61 @@ int loadImageFromImmich(const String &fileName) {
          album = esp_random() % albums.size();
       }
    }
+   Serial.printf("[IMMICH] Album %u of %u: %s\n", (unsigned)album + 1, (unsigned)albums.size(), albums[album].c_str());
+   return immichPost(base, "/api/search/random", Immich::legacyRandomSearchBody(albums[album], Immich::RANDOM_COUNT), answer);
+}
 
-   code = immichPost(base, "/api/search/random", Immich::randomSearchBody(albums[album], Immich::RANDOM_COUNT), answer);
+// Random picture of the Immich albums, saved as `fileName`. Every picture of all albums is equally
+// likely. Immich cannot search by orientation: of RANDOM_COUNT random pictures the frame takes one
+// that suits its display (landscape on the 7.3", portrait on the 13.3" display), so that it is not
+// shown with wide white stripes. Results as loadImageFromWeb().
+int loadImageFromImmich(const String &fileName) {
+   std::vector<std::string> albums;
+   Immich::parseAlbumList(settings.immichAlbumIds.c_str(), albums);
+   if (settings.immichUrl.length() == 0 || settings.immichApiKey.length() == 0 || albums.empty()) {
+      Serial.println("[IMMICH] Not set up: the URL, the API key and at least one album are needed");
+      return DL_HTTP_STATUS;
+   }
+   const String base = Immich::baseUrl(settings.immichUrl.c_str()).c_str();
+   String answer;
+   int code = -1;
+
+   if (immichSearchShape != IMMICH_SHAPE_LEGACY) {
+      code = immichPost(base, "/api/search/random", Immich::randomSearchBody(albums, Immich::RANDOM_COUNT), answer);
+      if (code == HTTP_CODE_OK) {
+         immichSearchShape = IMMICH_SHAPE_FILTER;
+      }
+      else if (code == 400 && immichSearchShape == 0) {
+         // an Immich older than 3.2 refuses the field "filter"
+         Serial.println("[IMMICH] The server does not know the search filter (Immich before 3.2), using the old search");
+         immichSearchShape = IMMICH_SHAPE_LEGACY;
+      }
+   }
+   if (immichSearchShape == IMMICH_SHAPE_LEGACY)
+      code = immichLegacySearch(base, albums, answer);
    if (code != HTTP_CODE_OK) {
       immichLogStatus("Random search", code);
       return (code < 0) ? DL_REQUEST_FAILED : DL_HTTP_STATUS;
    }
-   std::vector<std::string> assets;
-   if (!Immich::parseAssetIds(answer.c_str(), answer.length(), assets)) {
+
+   std::vector<Immich::Asset> assets;
+   if (!Immich::parseAssets(answer.c_str(), answer.length(), assets)) {
       Serial.println("[IMMICH] Answer of the random search not readable");
       return DL_HTTP_STATUS;
    }
-   const std::string asset = Immich::chooseAsset(assets, immichLastAsset);
-   if (asset.empty()) {
-      Serial.printf("[IMMICH] Album %s contains no pictures\n", albums[album].c_str());
+   answer = ""; // memory for the download
+   const int chosen = Immich::chooseAsset(assets, immichLastAsset, IMG_WIDTH, IMG_HEIGHT);
+   if (chosen < 0) {
+      Serial.println("[IMMICH] The albums contain no pictures");
       return DL_HTTP_STATUS;
    }
-   Serial.printf("[IMMICH] Album %u of %u (%s), picture %s\n", (unsigned)album + 1, (unsigned)albums.size(), albums[album].c_str(), asset.c_str());
+   const Immich::Asset &picked = assets[chosen];
+   const std::string asset = picked.id;
+   int suitable = 0;
+   for (const Immich::Asset &a : assets)
+      suitable += Immich::suitsDisplay(a, IMG_WIDTH, IMG_HEIGHT) ? 1 : 0;
+   Serial.printf("[IMMICH] Picture %s (%ux%u), %d of %u random pictures suit the %dx%d display\n", asset.c_str(),
+                 (unsigned)picked.width, (unsigned)picked.height, suitable, (unsigned)assets.size(), IMG_WIDTH, IMG_HEIGHT);
 
    const String url = base + Immich::previewPath(asset).c_str();
    int downloadOk = DL_REQUEST_FAILED;
@@ -3865,6 +3899,8 @@ void fetchRemoteSettings() {
          if (doc["immichUrl"].is<String>()) {
             String v = doc["immichUrl"].as<String>();
             if (v.length() <= MAX_SETTING_STRING_LEN) {
+               if (v != settings.immichUrl)
+                  immichSearchShape = 0; // perhaps another server
                settings.immichUrl = v;
                changed = true;
             }

@@ -86,12 +86,24 @@ std::string baseUrl(const std::string &url) {
    return base;
 }
 
-std::string randomSearchBody(const std::string &albumId, int count) {
+std::string randomSearchBody(const std::vector<std::string> &albumIds, int count) {
+   std::string ids;
+   for (size_t i = 0; i < albumIds.size(); i++) {
+      if (i > 0)
+         ids += ',';
+      ids += "\"" + albumIds[i] + "\"";
+   }
+   // The flat fields of older versions (albumIds, type) must not be mixed with "filter".
+   return "{\"filter\":{\"albumIds\":{\"any\":[" + ids + "]},\"type\":{\"eq\":\"IMAGE\"}},\"size\":" + std::to_string(count) +
+          ",\"withExif\":false,\"withPeople\":false}";
+}
+
+std::string legacyRandomSearchBody(const std::string &albumId, int count) {
    return "{\"albumIds\":[\"" + albumId + "\"],\"type\":\"IMAGE\",\"size\":" + std::to_string(count) +
           ",\"withExif\":false,\"withPeople\":false}";
 }
 
-std::string statisticsBody(const std::string &albumId) {
+std::string legacyStatisticsBody(const std::string &albumId) {
    return "{\"albumIds\":[\"" + albumId + "\"],\"type\":\"IMAGE\"}";
 }
 
@@ -119,19 +131,29 @@ int pickWeighted(const std::vector<uint32_t> &counts, uint64_t pick) {
    return -1; // not reached
 }
 
-bool parseAssetIds(const char *json, size_t length, std::vector<std::string> &ids) {
-   ids.clear();
-   JsonDocument filter;
-   filter[0]["id"] = true; // an asset carries much more (owner, dates, ...), only the ID is kept
+bool parseAssets(const char *json, size_t length, std::vector<Asset> &assets) {
+   assets.clear();
+   JsonDocument filter; // an asset carries much more (owner, dates, paths, ...): only this is kept
+   filter[0]["id"] = true;
+   filter[0]["width"] = true;
+   filter[0]["height"] = true;
    JsonDocument doc;
    if (deserializeJson(doc, json, length, DeserializationOption::Filter(filter)))
       return false;
    if (!doc.is<JsonArray>())
       return false;
-   for (JsonVariant asset : doc.as<JsonArray>()) {
-      const char *id = asset["id"];
-      if (id != nullptr && isUuid(id))
-         ids.push_back(id);
+   for (JsonVariant item : doc.as<JsonArray>()) {
+      const char *id = item["id"];
+      if (id == nullptr || !isUuid(id))
+         continue;
+      Asset asset;
+      asset.id = id;
+      // null while Immich has not read the metadata yet
+      if (item["width"].is<uint32_t>() && item["height"].is<uint32_t>()) {
+         asset.width = item["width"].as<uint32_t>();
+         asset.height = item["height"].as<uint32_t>();
+      }
+      assets.push_back(asset);
    }
    return true;
 }
@@ -149,12 +171,41 @@ bool parseStatisticsTotal(const char *json, size_t length, uint32_t &total) {
    return true;
 }
 
-std::string chooseAsset(const std::vector<std::string> &ids, const std::string &last) {
-   for (const std::string &id : ids) {
-      if (id != last)
-         return id;
+// How far the aspect ratio of a picture is from the display: 1 = the same, 1.25 = a 4:3 photo on
+// the 5:3 display. A picture of unknown size counts as far away.
+static double aspectDistance(const Asset &asset, int displayWidth, int displayHeight) {
+   if (asset.width == 0 || asset.height == 0 || displayWidth <= 0 || displayHeight <= 0)
+      return 1e9;
+   const double picture = (double)asset.width / asset.height;
+   const double display = (double)displayWidth / displayHeight;
+   return (picture > display) ? picture / display : display / picture;
+}
+
+// A 4:3 or 16:9 photo suits the 5:3 display (narrow stripes), a square or panorama one does not.
+// Above 1 this also means: the same orientation as the display.
+static constexpr double MAX_SUITABLE_DISTANCE = 1.5;
+
+bool suitsDisplay(const Asset &asset, int displayWidth, int displayHeight) {
+   return aspectDistance(asset, displayWidth, displayHeight) <= MAX_SUITABLE_DISTANCE;
+}
+
+int chooseAsset(const std::vector<Asset> &assets, const std::string &last, int displayWidth, int displayHeight) {
+   int closest = -1;
+   double closestDistance = 0;
+   for (size_t i = 0; i < assets.size(); i++) {
+      if (assets[i].id == last)
+         continue;
+      const double distance = aspectDistance(assets[i], displayWidth, displayHeight);
+      if (distance <= MAX_SUITABLE_DISTANCE)
+         return (int)i; // the search order is random: the first suitable one
+      if (closest < 0 || distance < closestDistance) {
+         closest = (int)i;
+         closestDistance = distance;
+      }
    }
-   return ids.empty() ? std::string() : ids.front();
+   if (closest >= 0)
+      return closest;
+   return assets.empty() ? -1 : 0; // only the picture shown last time
 }
 
 } // namespace Immich
