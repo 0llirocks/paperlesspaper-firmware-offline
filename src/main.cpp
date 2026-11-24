@@ -30,6 +30,7 @@
 #include "epaper_display.h"
 #include "gallery.h"
 #include "immich.h"
+#include "raster.h"
 #include "storage.h"
 #include "types.h"
 #include "usb_link.h"
@@ -271,8 +272,10 @@ uint32_t lastDownloadedBytes = 0;
 int serverSleepSeconds = 0;
 uint32_t serverSleepReceivedMs = 0;
 constexpr uint32_t IMAGE_SLOT_SIZE = (EPD_WIDTH * EPD_HEIGHT / 2) + 4096;
-int16_t err_curr[IMG_WIDTH * 3];
-int16_t err_next[IMG_WIDTH * 3];
+// the wider side: a picture for a turned frame is dithered in the turned raster (see convBegin)
+#define RASTER_MAX_W ((IMG_WIDTH > IMG_HEIGHT) ? IMG_WIDTH : IMG_HEIGHT)
+int16_t err_curr[RASTER_MAX_W * 3];
+int16_t err_next[RASTER_MAX_W * 3];
 char CLIENT_ID[20];
 uint8_t *bleWriteBuffer = nullptr;
 uint32_t bleWindowSize = BLE_BUFFER_SIZE; // bytes a client sends before a FLUSH
@@ -293,7 +296,7 @@ bool usbCheckConnect();
 int calculateSleepDuration(int defaultTimeout, bool forceReset, bool getDataOnly = false);
 bool resetAll(bool resetWifi);
 wakeup_reason_t getWakeupReason();
-int loadImageFromImmich(const String &fileName);
+int loadImageFromImmich(const String &fileName, bool frameTurned);
 void runSetupMode();
 int processHttpDownload(String fileName);
 bool sdInit(void);
@@ -480,6 +483,9 @@ bool hasValidFlashImage(const char *name = "tmp.bmp") {
 
 struct ImageConversion
 {
+   bool turned = false; // set before convBegin(): the raster is IMG_HEIGHT x IMG_WIDTH (turnRaster() turns it afterwards)
+   int rasterW = IMG_WIDTH;
+   int rasterH = IMG_HEIGHT;
    int outW = 0; // size of the picture on the display
    int outH = 0;
    int offX = 0;              // left margin (the top margin is written as white rows)
@@ -490,10 +496,10 @@ ImageConversion conv;
 
 // Writes white display rows until rowsWritten reaches untilRow.
 static void convWriteWhiteRows(int untilRow) {
-   uint8_t row[IMG_WIDTH / 2];
+   uint8_t row[RASTER_MAX_W / 2];
    memset(row, 0x66, sizeof(row));
-   while (conv.rowsWritten < untilRow && conv.rowsWritten < IMG_HEIGHT) {
-      rawOutFile.write(row, sizeof(row));
+   while (conv.rowsWritten < untilRow && conv.rowsWritten < conv.rasterH) {
+      rawOutFile.write(row, conv.rasterW / 2);
       conv.rowsWritten++;
    }
 }
@@ -508,17 +514,21 @@ static bool convBegin(int pictureW, int pictureH) {
    if (pictureW <= 0 || pictureH <= 0)
       return false;
 
+   conv.rasterW = conv.turned ? IMG_HEIGHT : IMG_WIDTH;
+   conv.rasterH = conv.turned ? IMG_WIDTH : IMG_HEIGHT;
+   const int rasterW = conv.rasterW;
+   const int rasterH = conv.rasterH;
    int outW = pictureW;
    int outH = pictureH;
-   if (outW > IMG_WIDTH || outH > IMG_HEIGHT) {
+   if (outW > rasterW || outH > rasterH) {
       // too large: scale down to fit, keep the aspect ratio
-      if ((int64_t)pictureW * IMG_HEIGHT >= (int64_t)pictureH * IMG_WIDTH) {
-         outW = IMG_WIDTH;
-         outH = (int)((int64_t)pictureH * IMG_WIDTH / pictureW);
+      if ((int64_t)pictureW * rasterH >= (int64_t)pictureH * rasterW) {
+         outW = rasterW;
+         outH = (int)((int64_t)pictureH * rasterW / pictureW);
       }
       else {
-         outH = IMG_HEIGHT;
-         outW = (int)((int64_t)pictureW * IMG_HEIGHT / pictureH);
+         outH = rasterH;
+         outW = (int)((int64_t)pictureW * rasterH / pictureH);
       }
       if (outW < 1)
          outW = 1;
@@ -534,13 +544,14 @@ static bool convBegin(int pictureW, int pictureH) {
    }
    conv.outW = outW;
    conv.outH = outH;
-   conv.offX = (IMG_WIDTH - outW) / 2;
+   conv.offX = (rasterW - outW) / 2;
    conv.rowsWritten = 0;
    memset(err_curr, 0, sizeof(err_curr));
    memset(err_next, 0, sizeof(err_next));
-   Serial.printf("[IMAGE] Picture %dx%d -> %dx%d on the %dx%d display\n", pictureW, pictureH, outW, outH, IMG_WIDTH, IMG_HEIGHT);
+   Serial.printf("[IMAGE] Picture %dx%d -> %dx%d on the %dx%d display%s\n", pictureW, pictureH, outW, outH, rasterW, rasterH,
+                 conv.turned ? " (frame turned by 90 degrees)" : "");
 
-   convWriteWhiteRows((IMG_HEIGHT - outH) / 2);
+   convWriteWhiteRows((rasterH - outH) / 2);
    return true;
 }
 
@@ -551,10 +562,10 @@ static bool convBegin(int pictureW, int pictureH) {
 //   without dots, also next to coloured ones.
 // - The four parts of an error add up to the error exactly.
 static void convWriteRow() {
-   if (conv.rowsWritten >= IMG_HEIGHT)
+   if (conv.rowsWritten >= conv.rasterH)
       return;
 
-   uint8_t out_row[IMG_WIDTH / 2];
+   uint8_t out_row[RASTER_MAX_W / 2];
    memset(out_row, 0x66, sizeof(out_row));
    const uint8_t *rgb = conv.rowRgb;
    const int lastX = conv.outW - 1;
@@ -606,7 +617,7 @@ static void convWriteRow() {
          out_row[px / 2] = (out_row[px / 2] & 0xF0) | (best & 0x0F);
    }
 
-   rawOutFile.write(out_row, sizeof(out_row));
+   rawOutFile.write(out_row, conv.rasterW / 2);
    memcpy(err_curr, err_next, sizeof(err_curr));
    memset(err_next, 0, sizeof(err_next));
    conv.rowsWritten++;
@@ -614,7 +625,7 @@ static void convWriteRow() {
 
 // Writes the white rows below the picture and closes the display image.
 static bool convFinish() {
-   convWriteWhiteRows(IMG_HEIGHT);
+   convWriteWhiteRows(conv.rasterH);
    convRelease();
    return rawOutFile.close();
 }
@@ -895,7 +906,7 @@ static bool convertBmp(StoreFile &inFile, const char *outFileName) {
       return false;
    }
 
-   if (bpp == 4 && topDown && width == IMG_WIDTH && height == IMG_HEIGHT) {
+   if (!conv.turned && bpp == 4 && topDown && width == IMG_WIDTH && height == IMG_HEIGHT) {
       Serial.println("[IMAGE] 4-bit BMP detected. Already dithered.");
       return copyDisplayImage(inFile, outFileName);
    }
@@ -972,7 +983,80 @@ static bool convertBmp(StoreFile &inFile, const char *outFileName) {
    return convFinish();
 }
 
-bool processImageFile(const char *rawFileName, const char *outFileName) {
+// --- Turned frame ---
+//
+// The accelerometer tells the side the frame stands on (accInit(): 0 .. 3, -1 = no reading).
+// 0 and 2 are opposite sides, 1 and 3 as well; between the two pairs the frame is turned by 90°.
+// Upside down (2, 3) is already handled when the picture is drawn (displaySetRotation()).
+//
+// NOT MEASURED ON A DEVICE YET - a default to be checked (docs on branch `claude`, docs/immich.md):
+//   - 0 and 2: the frame stands as its display is built (7.3" landscape, 13.3" portrait),
+//   - 1 and 3: turned by 90°,
+//   - a picture for a turned frame is turned by 270° (as the web UI turns a gallery picture for
+//     the other orientation), on 1 upright, on 3 upside down and then flipped when drawn.
+// If a device shows it the other way round, only these three lines change.
+#define FRAME_TURNED_SIDE_A 1
+#define FRAME_TURNED_SIDE_B 3
+#define FRAME_TURN_DEGREES 270
+
+// 0 if the frame stands as its display is built, else the degrees a picture is turned by.
+// Only with auto rotation switched on (otherwise the sensor is not used for the picture).
+static int frameTurnDegrees() {
+   if (!settings.autoRotation)
+      return 0;
+   const int side = systemData.deviceOrientation;
+   return (side == FRAME_TURNED_SIDE_A || side == FRAME_TURNED_SIDE_B) ? FRAME_TURN_DEGREES : 0;
+}
+
+#define TURN_FILE "tmp_turn.bin" // the picture in the turned raster, before turnRaster()
+
+static bool readStoreFile(void *context, uint32_t offset, uint8_t *buf, uint32_t len) {
+   StoreFile *file = (StoreFile *)context;
+   return file->seek(offset) && file->read(buf, len) == len;
+}
+
+// Turns the raster in `srcName` (IMG_HEIGHT x IMG_WIDTH) by `degrees` into the display raster in
+// `dstName` (IMG_WIDTH x IMG_HEIGHT), in bands of rows (Raster::turnBand).
+static bool turnRaster(const char *srcName, const char *dstName, int degrees) {
+   StoreFile src;
+   if (!src.openRead(srcName))
+      return false;
+   const uint32_t rowBytes = IMG_WIDTH / 2;
+   int bandRows = 160; // 64 KB on 7.3", 96 KB on 13.3": fewer pieces to read; less if the heap is short
+   uint8_t *band = nullptr;
+   while (bandRows >= 2 && (band = (uint8_t *)malloc(bandRows * rowBytes)) == nullptr)
+      bandRows /= 2;
+   if (band == nullptr) {
+      Serial.println("[IMAGE] OOM turning the picture");
+      return false;
+   }
+   bandRows &= ~1;
+   if (!openOutputFile(dstName, rawOutFile)) {
+      free(band);
+      return false;
+   }
+   const uint32_t start = millis();
+   bool ok = true;
+   for (int y0 = 0; y0 < IMG_HEIGHT && ok; y0 += bandRows) {
+      const int rows = (IMG_HEIGHT - y0 < bandRows) ? IMG_HEIGHT - y0 : bandRows;
+      ok = Raster::turnBand(IMG_HEIGHT, IMG_WIDTH, degrees, y0, rows, readStoreFile, &src, band) &&
+           rawOutFile.write(band, rows * rowBytes) == rows * rowBytes;
+   }
+   free(band);
+   src.close();
+   if (!ok) {
+      Serial.println("[IMAGE] Turning the picture failed");
+      discardFile(rawOutFile, dstName);
+      return false;
+   }
+   Serial.printf("[IMAGE] Picture turned by %d degrees in %u ms (bands of %d rows)\n", degrees, (unsigned)(millis() - start), bandRows);
+   return rawOutFile.close();
+}
+
+// turnDegrees: 0, or 90 / 270 for a frame that hangs turned (frameTurnDegrees()). The picture is
+// then fitted to the turned raster and turned into the display raster afterwards, so that it is
+// upright on the frame. (A raw display image is taken as it is.)
+bool processImageFile(const char *rawFileName, const char *outFileName, int turnDegrees = 0) {
    StoreFile inFile;
    if (!inFile.openRead(rawFileName))
       return false;
@@ -980,21 +1064,36 @@ bool processImageFile(const char *rawFileName, const char *outFileName) {
    inFile.read(magic, 2);
    Serial.printf("[IMAGE] Read magic: 0x%02X 0x%02X from file '%s'\n", magic[0], magic[1], rawFileName);
 
+   const bool jpeg = magic[0] == 0xFF && magic[1] == 0xD8;
+   const bool bmp = magic[0] == 'B' && magic[1] == 'M';
+   if (turnDegrees != 0 && (jpeg || bmp) && Storage::freeBytes() < (uint32_t)IMG_WIDTH * IMG_HEIGHT / 2 + 65536) {
+      Serial.println("[IMAGE] Not enough free storage to turn the picture, shown as it is");
+      turnDegrees = 0;
+   }
+   const bool turn = turnDegrees != 0 && (jpeg || bmp);
+   const char *target = turn ? TURN_FILE : outFileName;
+
    bool ok = false;
-   if (magic[0] == 0xFF && magic[1] == 0xD8) {
+   conv.turned = turn;
+   if (jpeg) {
       Serial.println("[IMAGE] JPEG detected. Dithering on-device...");
       inFile.close(); // the decoder opens the file itself
-      return convertJpeg(rawFileName, outFileName);
+      ok = convertJpeg(rawFileName, target);
    }
-   else if (magic[0] == 'B' && magic[1] == 'M') {
-      ok = convertBmp(inFile, outFileName);
+   else if (bmp) {
+      ok = convertBmp(inFile, target);
    }
    else if (magic[0] == 0x66 && magic[1] == 0x66) {
       Serial.println("[IMAGE] Raw dithered payload detected.");
       ok = copyDisplayImage(inFile, outFileName);
    }
-
+   conv.turned = false;
    inFile.close();
+
+   if (turn) {
+      ok = ok && turnRaster(TURN_FILE, outFileName, turnDegrees);
+      Storage::remove(TURN_FILE);
+   }
    return ok;
 }
 
@@ -3542,12 +3641,16 @@ bool ensureWifi() {
 int processHttpDownload(String fileName) {
    int dlSuccess = 0;
    if (ensureWifi()) {
-      if (settings.imageMode == IMAGE_MODE_IMMICH)
-         dlSuccess = loadImageFromImmich("tmp_raw.bin");
+      // Immich: the photo is chosen for the way the frame hangs and turned to suit it. (A picture
+      // of a download URL is shown as the server prepared it.)
+      const bool immich = settings.imageMode == IMAGE_MODE_IMMICH;
+      const int turn = immich ? frameTurnDegrees() : 0;
+      if (immich)
+         dlSuccess = loadImageFromImmich("tmp_raw.bin", turn != 0);
       else
          dlSuccess = loadImageFromWeb(settings.downloadUrl, "tmp_raw.bin");
       if (dlSuccess == 0) {
-         if (processImageFile("tmp_raw.bin", fileName.c_str())) {
+         if (processImageFile("tmp_raw.bin", fileName.c_str(), turn)) {
             dlSuccess = 0;
          }
          else {
@@ -3709,9 +3812,13 @@ static int immichLegacySearch(const String &base, const std::vector<std::string>
 
 // Random picture of the Immich albums, saved as `fileName`. Every picture of all albums is equally
 // likely. Immich cannot search by orientation: of RANDOM_COUNT random pictures the frame takes one
-// that suits its display (landscape on the 7.3", portrait on the 13.3" display), so that it is not
-// shown with wide white stripes. Results as loadImageFromWeb().
-int loadImageFromImmich(const String &fileName) {
+// that suits the way it hangs (as built: landscape on the 7.3", portrait on the 13.3" display;
+// `frameTurned` (frameTurnDegrees()): the other way round), so that it is not shown with wide
+// white stripes. Results as loadImageFromWeb().
+int loadImageFromImmich(const String &fileName, bool frameTurned) {
+   // the display as the viewer sees it
+   const int viewW = frameTurned ? IMG_HEIGHT : IMG_WIDTH;
+   const int viewH = frameTurned ? IMG_WIDTH : IMG_HEIGHT;
    std::vector<std::string> albums;
    Immich::parseAlbumList(settings.immichAlbumIds.c_str(), albums);
    if (settings.immichUrl.length() == 0 || settings.immichApiKey.length() == 0 || albums.empty()) {
@@ -3746,7 +3853,7 @@ int loadImageFromImmich(const String &fileName) {
       return DL_HTTP_STATUS;
    }
    answer = ""; // memory for the download
-   const int chosen = Immich::chooseAsset(assets, immichLastAsset, IMG_WIDTH, IMG_HEIGHT);
+   const int chosen = Immich::chooseAsset(assets, immichLastAsset, viewW, viewH);
    if (chosen < 0) {
       Serial.println("[IMMICH] The albums contain no pictures");
       return DL_HTTP_STATUS;
@@ -3755,9 +3862,10 @@ int loadImageFromImmich(const String &fileName) {
    const std::string asset = picked.id;
    int suitable = 0;
    for (const Immich::Asset &a : assets)
-      suitable += Immich::suitsDisplay(a, IMG_WIDTH, IMG_HEIGHT) ? 1 : 0;
-   Serial.printf("[IMMICH] Picture %s (%ux%u), %d of %u random pictures suit the %dx%d display\n", asset.c_str(),
-                 (unsigned)picked.width, (unsigned)picked.height, suitable, (unsigned)assets.size(), IMG_WIDTH, IMG_HEIGHT);
+      suitable += Immich::suitsDisplay(a, viewW, viewH) ? 1 : 0;
+   Serial.printf("[IMMICH] Frame side %d: %s. Picture %s (%ux%u), %d of %u random pictures suit the %dx%d view\n",
+                 systemData.deviceOrientation, frameTurned ? "turned" : "as built", asset.c_str(), (unsigned)picked.width,
+                 (unsigned)picked.height, suitable, (unsigned)assets.size(), viewW, viewH);
 
    const String url = base + Immich::previewPath(asset).c_str();
    int downloadOk = DL_REQUEST_FAILED;

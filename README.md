@@ -113,12 +113,15 @@ Details:
 Instead of a download URL the frame can show a random photo from your [Immich](https://immich.app/) server. In the Web UI choose **Abruf per URL → Immich** and enter the server, an API key and up to 10 albums (album links copied from the Immich web app, or album IDs). At every wake-up the frame:
 
 1. asks for 10 random photos of all albums together (`POST /api/search/random` with `filter.albumIds.any`), so every photo is equally likely,
-2. takes the first one that suits the display and was not shown last time: landscape on the 7.3" display, portrait on the 13.3" display (aspect ratio at most 1.5 times off, so 4:3, 3:2 and 16:9 photos suit, square and panorama photos do not). Immich cannot search by orientation, so the frame chooses from the photo sizes (`width`, `height`) in the answer. If none of the 10 suits, it takes the one closest to the display,
-3. downloads its preview (`GET /api/assets/<id>/thumbnail?size=preview`) and fits and dithers it like any JPEG.
+2. takes the first one that suits the way the frame hangs and was not shown last time (aspect ratio at most 1.5 times off, so 4:3, 3:2 and 16:9 photos suit, square and panorama photos do not). Immich cannot search by orientation, so the frame chooses from the photo sizes (`width`, `height`) in the answer. If none of the 10 suits, it takes the one closest,
+3. downloads its preview (`GET /api/assets/<id>/thumbnail?size=preview`), fits and dithers it like any JPEG and, if the frame hangs turned, turns it by 90° so that it is upright.
 
 Immich before 3.2 does not know `filter`: the frame then notices the refusal (HTTP 400) and uses the old search. There several albums in one search mean "in all of these albums", so the frame counts the photos of each album (`POST /api/search/statistics`) and draws the album by that number.
 
-The frame does not turn pictures by 90° (auto rotation only turns them upside down), so the orientation that suits is the one of the display, not the side the frame stands on.
+**Orientation:** with **Auto rotation** switched on, the accelerometer tells the frame how it hangs (see `X-OpenPaper-Orientation`). Standing as its display is built (sides `0` and `2`) it shows landscape photos on the 7.3" and portrait photos on the 13.3" display; turned by 90° (sides `1` and `3`) the other way round. Upside down is handled as for every picture. With auto rotation switched off, the frame takes the orientation of its display. A download URL and the gallery are not affected: their pictures are shown as they were prepared.
+
+> [!NOTE]
+> Which sensor sides mean "turned" and the direction of the turn (270° clockwise, as the Web UI turns gallery pictures) are a default that has not been checked on a device yet (`FRAME_TURNED_SIDE_A`, `FRAME_TURNED_SIDE_B`, `FRAME_TURN_DEGREES` in `src/main.cpp`).
 
 - **API key:** create it in Immich under *Account Settings → API Keys*. Permissions: `asset.read` and `asset.view`; Immich before 3.2 with more than one album also needs `asset.statistics` (without it every album is equally likely). The key is sent as `x-api-key`; it can be written but not read back over Bluetooth.
 - **Preview format:** the previews must be JPEG and not progressive (Immich *Administration → Settings → Image Settings*). WebP previews are refused, progressive JPEGs are shown at 1/8 of their resolution.
